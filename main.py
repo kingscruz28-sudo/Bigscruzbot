@@ -1,20 +1,18 @@
 import requests
 import time
 from datetime import datetime
+import os
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8334034705:AAH_DCZsBKxOsnh_EXLR6JW3bPZIi_QIHWE")
+CHAT_ID = os.environ.get("CHAT_ID", "887594990")
+
 
 # ============================================================
 # BIGSCRUZ CRT + MALAYSIAN S/R SIGNAL BOT
-# Telegram: @BigscruzBot
-# Strategy: CRT sweep + Malaysian Support & Resistance
 # ============================================================
 
-TELEGRAM_TOKEN = "8334034705:AAH_DCZsBKxOsnh_EXLR6JW3bPZIi_QIHWE"
-CHAT_ID = "887594990"
-
 # --- CONFIG ---
-SYMBOL = "XBTUSD"          # BTC on Kraken
-TIMEFRAME_1H = 60           # 1 hour candles for CRT range
-TIMEFRAME_1M = 1            # 1 min candles for entry trigger
+SYMBOL = "XBTUSD"
 SR_LOOKBACK = 50            # candles to find S/R levels
 SWEEP_BUFFER = 0.0005       # 0.05% buffer for sweep detection
 CHECK_INTERVAL = 60         # check every 60 seconds
