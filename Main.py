@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHAT_ID           = int(os.environ["CHAT_ID"])
-ER_API_KEY        = os.environ["ER_API_KEY"]   # exchangerate-api.com key
+ER_API_KEY        = os.environ["ER_API_KEY"]
 
 # ── Anthropic Client ──────────────────────────────────────────────────────────
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -50,7 +50,7 @@ _event_loop: asyncio.AbstractEventLoop | None = None
 _bot_ref = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAFE SEND  (thread -> async bridge)
+# SAFE SEND
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -70,7 +70,7 @@ def safe_send(text: str):
 
 
 def fetch_crypto_prices() -> dict[str, float | None]:
-    """CoinGecko free API — ETH, SOL, BTC. No key needed."""
+    """CoinGecko free API — ETH, SOL, BTC."""
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price"
@@ -89,10 +89,12 @@ def fetch_crypto_prices() -> dict[str, float | None]:
 
 
 def fetch_forex_gold() -> dict[str, float | None]:
+    """
+    Single ER API call gives us both USD/JPY and Gold.
+    Response includes conversion_rates with JPY and XAU.
+    Gold price = 1 / XAU_rate  (since XAU rate = troy oz per USD)
+    """
     results: dict[str, float | None] = {"USD/JPY": None, "XAU/USD": None}
-
-    # USD/JPY — exchangerate-api.com with API key
-    # URL format: https://v6.exchangerate-api.com/v6/YOUR_KEY/latest/USD
     try:
         r = requests.get(
             f"https://v6.exchangerate-api.com/v6/{ER_API_KEY}/latest/USD",
@@ -100,25 +102,23 @@ def fetch_forex_gold() -> dict[str, float | None]:
         )
         data = r.json()
         if data.get("result") == "success":
-            results["USD/JPY"] = data["conversion_rates"].get("JPY")
-            log.info(f"USD/JPY from ER API: {results['USD/JPY']}")
+            rates = data["conversion_rates"]
+
+            # USD/JPY direct
+            jpy = rates.get("JPY")
+            if jpy:
+                results["USD/JPY"] = float(jpy)
+                log.info(f"USD/JPY from ER API: {results['USD/JPY']}")
+
+            # Gold: XAU rate is oz-per-USD, so flip it to get USD-per-oz
+            xau = rates.get("XAU")
+            if xau and xau > 0:
+                results["XAU/USD"] = round(1.0 / float(xau), 2)
+                log.info(f"XAU/USD from ER API: {results['XAU/USD']}")
+        else:
+            log.warning(f"ER API bad response: {data.get('result')}")
     except Exception as e:
         log.error(f"ER API error: {e}")
-
-    # Gold — frankfurter.app (free, no key)
-    # Returns: {"rates": {"USD": 4186.xx}} when base=XAU
-    try:
-        r = requests.get(
-            "https://api.frankfurter.app/latest?from=XAU&to=USD",
-            timeout=10,
-        )
-        xau = r.json().get("rates", {}).get("USD")
-        if xau:
-            results["XAU/USD"] = float(xau)
-            log.info(f"XAU/USD from Frankfurter: {results['XAU/USD']}")
-    except Exception as e:
-        log.warning(f"Frankfurter gold error: {e}")
-
     return results
 
 
@@ -266,7 +266,7 @@ def ask_jarvis(user_message: str, context_prices: dict | None = None) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM COMMAND HANDLERS
+# TELEGRAM HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -342,7 +342,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GLOBAL ERROR HANDLER
+# ERROR HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -359,7 +359,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKGROUND SCANNER THREAD
+# BACKGROUND SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 
 
