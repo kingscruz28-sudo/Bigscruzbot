@@ -88,13 +88,29 @@ def fetch_crypto_prices() -> dict[str, float | None]:
         return {"ETH/USD": None, "SOL/USD": None, "BTC/USD": None}
 
 
-def fetch_forex_gold() -> dict[str, float | None]:
-    """
-    Single ER API call gives us both USD/JPY and Gold.
-    Response includes conversion_rates with JPY and XAU.
-    Gold price = 1 / XAU_rate  (since XAU rate = troy oz per USD)
-    """
-    results: dict[str, float | None] = {"USD/JPY": None, "XAU/USD": None}
+def fetch_gold_price() -> float | None:
+    """Yahoo Finance GC=F (Gold Futures) — free, no key needed."""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF"
+            "?interval=1d&range=1d",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        data = r.json()
+        price = (
+            data["chart"]["result"][0]
+            ["meta"]["regularMarketPrice"]
+        )
+        log.info(f"XAU/USD from Yahoo Finance: {price}")
+        return float(price)
+    except Exception as e:
+        log.error(f"Yahoo gold error: {e}")
+        return None
+
+
+def fetch_usdjpy_price() -> float | None:
+    """ER API for USD/JPY."""
     try:
         r = requests.get(
             f"https://v6.exchangerate-api.com/v6/{ER_API_KEY}/latest/USD",
@@ -102,28 +118,24 @@ def fetch_forex_gold() -> dict[str, float | None]:
         )
         data = r.json()
         if data.get("result") == "success":
-            rates = data["conversion_rates"]
-
-            # USD/JPY direct
-            jpy = rates.get("JPY")
+            jpy = data["conversion_rates"].get("JPY")
             if jpy:
-                results["USD/JPY"] = float(jpy)
-                log.info(f"USD/JPY from ER API: {results['USD/JPY']}")
-
-            # Gold: XAU rate is oz-per-USD, so flip it to get USD-per-oz
-            xau = rates.get("XAU")
-            if xau and xau > 0:
-                results["XAU/USD"] = round(1.0 / float(xau), 2)
-                log.info(f"XAU/USD from ER API: {results['XAU/USD']}")
-        else:
-            log.warning(f"ER API bad response: {data.get('result')}")
+                log.info(f"USD/JPY from ER API: {jpy}")
+                return float(jpy)
     except Exception as e:
         log.error(f"ER API error: {e}")
-    return results
+    return None
 
 
 def fetch_all_prices() -> dict[str, float | None]:
-    return {**fetch_crypto_prices(), **fetch_forex_gold()}
+    crypto = fetch_crypto_prices()
+    return {
+        "XAU/USD": fetch_gold_price(),
+        "ETH/USD": crypto.get("ETH/USD"),
+        "USD/JPY": fetch_usdjpy_price(),
+        "SOL/USD": crypto.get("SOL/USD"),
+        "BTC/USD": crypto.get("BTC/USD"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
