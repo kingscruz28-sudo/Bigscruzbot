@@ -12,8 +12,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # Strategy: CRT sweep + Malaysian Support & Resistance
 # ============================================================
 
-TELEGRAM_TOKEN = "8334034705:AAH_DCZsBKxOsnh_EXLR6JW3bPZIi_QIHWE"
-CHAT_ID = "887594990"
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+
 
 # --- CONFIG ---
 SYMBOL = "XBTUSD"          # BTC on Kraken
