@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 import threading
 import requests
@@ -9,7 +10,7 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO
@@ -17,15 +18,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TWELVE_API_KEY    = os.environ["TWELVE_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-CHAT_ID          = int(os.environ["CHAT_ID"])
+CHAT_ID           = int(os.environ["CHAT_ID"])
 
 # ── Anthropic Client ──────────────────────────────────────────────────────────
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── Markets to Watch ──────────────────────────────────────────────────────────
+# ── Markets ───────────────────────────────────────────────────────────────────
 SYMBOLS = {
     "XAU/USD": "Gold",
     "ETH/USD": "Ethereum",
@@ -39,14 +40,31 @@ TWELVE_SYMBOLS = {
     "ETH/USD": "ETH/USD",
     "USD/JPY": "USD/JPY",
     "SOL/USD": "SOL/USD",
-    "XBT/USD": "BTC/USD",   # Twelve Data uses BTC/USD
+    "XBT/USD": "BTC/USD",
 }
 
 # ── State ─────────────────────────────────────────────────────────────────────
-price_history: dict[str, list[float]] = {s: [] for s in SYMBOLS}
-last_prices:   dict[str, float]       = {}
-sent_news_urls: set[str]              = set()
-app_ref = None   # set after build
+price_history:  dict[str, list[float]] = {s: [] for s in SYMBOLS}
+last_prices:    dict[str, float]       = {}
+sent_news_urls: set[str]               = set()
+
+# Set after the async event loop starts
+_event_loop: asyncio.AbstractEventLoop | None = None
+_bot_ref = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAFE SEND  (thread -> async bridge)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def safe_send(text: str):
+    """Schedule a Telegram message from any thread."""
+    if _event_loop is None or _bot_ref is None:
+        log.warning("safe_send called before bot is ready")
+        return
+    asyncio.run_coroutine_threadsafe(
+        _bot_ref.send_message(chat_id=CHAT_ID, text=text),
+        _event_loop,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING
@@ -55,7 +73,7 @@ app_ref = None   # set after build
 def fetch_price(symbol: str) -> float | None:
     twelve_sym = TWELVE_SYMBOLS.get(symbol, symbol)
     url = (
-        f"https://api.twelvedata.com/price"
+        "https://api.twelvedata.com/price"
         f"?symbol={twelve_sym}&apikey={TWELVE_API_KEY}"
     )
     try:
@@ -73,76 +91,70 @@ def fetch_all_prices() -> dict[str, float | None]:
     return {sym: fetch_price(sym) for sym in SYMBOLS}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CRT SIGNAL DETECTION
+# SIGNAL DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def pip_size(symbol: str) -> float:
+    if "JPY" in symbol:
+        return 0.01
+    if symbol == "XAU/USD":
+        return 0.10
+    if symbol in ("ETH/USD", "SOL/USD", "XBT/USD"):
+        return 1.0
+    return 0.0001
+
+
 def detect_crt_signal(symbol: str, price: float) -> str | None:
-    """
-    Simple CRT (Candle Range Theory) High/Low sweep detection.
-    Needs at least 20 data points. Returns signal string or None.
-    """
     history = price_history[symbol]
     if len(history) < 20:
         return None
 
     recent   = history[-5:]
     lookback = history[-20:-5]
-
     prev_high = max(lookback)
     prev_low  = min(lookback)
     curr_high = max(recent)
     curr_low  = min(recent)
+    ps   = pip_size(symbol)
+    name = SYMBOLS[symbol]
 
-    sweep_high = curr_high > prev_high and price < prev_high
-    sweep_low  = curr_low  < prev_low  and price > prev_low
-
-    pip_size = 0.0001 if "JPY" not in symbol else 0.01
-    if symbol in ("XAU/USD",):
-        pip_size = 0.1
-    if symbol in ("ETH/USD", "SOL/USD", "XBT/USD"):
-        pip_size = 1.0
-
-    if sweep_high:
-        entry  = price
-        sl     = curr_high + (50 * pip_size)
-        tp     = entry - (150 * pip_size)
+    # High sweep -> SELL
+    if curr_high > prev_high and price < prev_high:
+        entry = price
+        sl    = curr_high + (50 * ps)
+        tp    = entry - (150 * ps)
         return (
-            f"🔻 CRT SELL SIGNAL — {SYMBOLS[symbol]}\n"
+            f"SELL SIGNAL  {name}\n"
             f"High swept: {prev_high:.4f}\n"
-            f"Entry: {entry:.4f}\n"
-            f"SL:    {sl:.4f}\n"
-            f"TP:    {tp:.4f} (150 pips)\n"
-            f"Strategy: CRT High Sweep + Malaysian S/R"
+            f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+            f"150 pips target | CRT + Malaysian S/R"
         )
 
-    if sweep_low:
-        entry  = price
-        sl     = curr_low  - (50 * pip_size)
-        tp     = entry + (150 * pip_size)
+    # Low sweep -> BUY
+    if curr_low < prev_low and price > prev_low:
+        entry = price
+        sl    = curr_low - (50 * ps)
+        tp    = entry + (150 * ps)
         return (
-            f"🟢 CRT BUY SIGNAL — {SYMBOLS[symbol]}\n"
+            f"BUY SIGNAL  {name}\n"
             f"Low swept: {prev_low:.4f}\n"
-            f"Entry: {entry:.4f}\n"
-            f"SL:    {sl:.4f}\n"
-            f"TP:    {tp:.4f} (150 pips)\n"
-            f"Strategy: CRT Low Sweep + Malaysian S/R"
+            f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+            f"150 pips target | CRT + Malaysian S/R"
         )
 
     return None
 
 
 def detect_spike(symbol: str, price: float) -> str | None:
-    """Alert if price moves 1%+ from last recorded price."""
     last = last_prices.get(symbol)
     if last is None:
         return None
-    change_pct = abs(price - last) / last * 100
-    if change_pct >= 1.0:
-        direction = "📈" if price > last else "📉"
+    pct = abs(price - last) / last * 100
+    if pct >= 1.0:
+        arrow = "UP" if price > last else "DOWN"
         return (
-            f"{direction} PRICE SPIKE — {SYMBOLS[symbol]}\n"
-            f"Move: {change_pct:.2f}%\n"
-            f"From: {last:.4f} → {price:.4f}"
+            f"PRICE SPIKE {arrow}  {SYMBOLS[symbol]}\n"
+            f"Move: {pct:.2f}%  |  {last:.4f} to {price:.4f}"
         )
     return None
 
@@ -170,73 +182,65 @@ def fetch_news(limit: int = 5) -> list[dict]:
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:10]:
-                title   = entry.get("title", "")
-                link    = entry.get("link", "")
-                summary = entry.get("summary", "")[:200]
+                title = entry.get("title", "")
+                link  = entry.get("link", "")
                 if link and link not in sent_news_urls:
-                    articles.append({
-                        "title":   title,
-                        "link":    link,
-                        "summary": summary,
-                    })
+                    articles.append({"title": title, "link": link})
         except Exception as e:
-            log.error(f"News fetch error ({feed_url}): {e}")
+            log.error(f"News feed error ({feed_url}): {e}")
     return articles[:limit]
 
 
 def is_market_relevant(title: str) -> bool:
-    t = title.lower()
-    return any(kw in t for kw in MARKET_KEYWORDS)
+    return any(kw in title.lower() for kw in MARKET_KEYWORDS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI CHAT
+# AI
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Jarvis, an elite AI trading assistant specialising in:
-- CRT (Candle Range Theory) High/Low sweep strategy
-- Malaysian S/R (Support & Resistance) confluences
-- Forex, Gold, Crypto, and indices
-- Target: 100-150 pips minimum per trade
-
-Always be concise, confident, and focused on trade setups.
-When asked what to buy/trade, analyse current market conditions and give a direct recommendation with entry, SL, and TP.
-Never give financial advice disclaimers — the user knows this is for informational purposes."""
+SYSTEM_PROMPT = (
+    "You are Jarvis, an elite AI trading assistant specialising in:\n"
+    "- CRT (Candle Range Theory) High/Low sweep strategy\n"
+    "- Malaysian S/R confluences\n"
+    "- Forex, Gold, Crypto, and indices\n"
+    "- Target: 100-150 pips minimum per trade\n\n"
+    "Be concise and direct. Always give entry, SL, and TP when discussing trades."
+)
 
 
 def ask_jarvis(user_message: str, context_prices: dict | None = None) -> str:
-    price_context = ""
+    price_lines = ""
     if context_prices:
-        lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in context_prices.items() if p]
-        price_context = "\nCurrent prices:\n" + "\n".join(lines)
-
+        lines = [
+            f"  {SYMBOLS.get(s, s)}: {p:.4f}"
+            for s, p in context_prices.items() if p
+        ]
+        price_lines = "\nCurrent prices:\n" + "\n".join(lines)
     try:
-        response = ai_client.messages.create(
+        resp = ai_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": f"{user_message}{price_context}"}
-            ],
+            messages=[{"role": "user", "content": f"{user_message}{price_lines}"}],
         )
-        return response.content[0].text
+        return resp.content[0].text
     except Exception as e:
         log.error(f"Anthropic error: {e}")
-        return f"Jarvis error: {e}"
+        return f"Jarvis AI error: {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM HANDLERS
+# TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Jarvis online.\n"
         "Watching: Gold, ETH, USD/JPY, SOL, BTC\n\n"
-        "Commands:\n"
-        "/price  — current prices\n"
-        "/status — bot status\n"
-        "/news   — latest market news\n"
-        "/signal — scan for CRT setups\n"
-        "Or just ask me anything."
+        "/price  - current prices\n"
+        "/status - bot status\n"
+        "/news   - latest market news\n"
+        "/signal - scan for CRT setups\n"
+        "Or ask me anything."
     )
 
 
@@ -244,20 +248,20 @@ async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices = fetch_all_prices()
     lines = ["Current Prices:"]
     for sym, price in prices.items():
-        name = SYMBOLS[sym]
-        val  = f"{price:,.4f}" if price else "unavailable"
-        lines.append(f"  {name}: {val}")
+        val = f"{price:,.4f}" if price else "unavailable"
+        lines.append(f"  {SYMBOLS[sym]}: {val}")
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    n_prices = sum(1 for p in last_prices.values() if p)
+    n     = sum(1 for p in last_prices.values() if p)
+    depth = len(price_history.get("XAU/USD", []))
     await update.message.reply_text(
         f"Jarvis Status\n"
-        f"Active markets: {n_prices}/{len(SYMBOLS)}\n"
-        f"History depth:  {len(price_history.get('XAU/USD', []))} candles\n"
-        f"News seen:      {len(sent_news_urls)} articles\n"
-        f"Uptime: running"
+        f"Active markets: {n}/{len(SYMBOLS)}\n"
+        f"History depth:  {depth} candles\n"
+        f"News tracked:   {len(sent_news_urls)} articles\n"
+        f"Status: RUNNING"
     )
 
 
@@ -274,37 +278,42 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices = fetch_all_prices()
-    signals_found = []
+    found  = []
     for sym, price in prices.items():
         if price is None:
             continue
         price_history[sym].append(price)
         sig = detect_crt_signal(sym, price)
         if sig:
-            signals_found.append(sig)
-
-    if signals_found:
-        for sig in signals_found:
+            found.append(sig)
+    if found:
+        for sig in found:
             await update.message.reply_text(sig)
     else:
+        depth = len(price_history.get("XAU/USD", []))
         await update.message.reply_text(
-            "No CRT setups detected right now.\n"
-            "Still building price history or markets are ranging."
+            f"No CRT setups detected.\n"
+            f"History: {depth}/20 candles. Markets may be ranging."
         )
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     prices = fetch_all_prices()
-    reply = ask_jarvis(text, prices)
+    reply  = ask_jarvis(update.message.text, prices)
     await update.message.reply_text(reply)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKGROUND SCANNER
+# BACKGROUND SCANNER THREAD
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scanner_loop(app):
-    """Runs in background thread: scans prices + news every 60 seconds."""
+def scanner_loop():
+    """
+    Daemon thread. Waits for _event_loop to be set, then scans every 60s.
+    All Telegram sends go through safe_send() -> run_coroutine_threadsafe().
+    """
+    while _event_loop is None:
+        time.sleep(1)
+
     loop_count = 0
     while True:
         try:
@@ -317,44 +326,38 @@ def scanner_loop(app):
                 if price is None:
                     continue
 
-                name = SYMBOLS[sym]
-                score = len(price_history[sym])
-                log.info(f"  [{sym}] {name}: {price:,.4f} | History: {score}")
+                log.info(
+                    f"  [{sym}] {SYMBOLS[sym]}: {price:,.4f} "
+                    f"| History: {len(price_history[sym])}"
+                )
 
-                # Spike check
+                # 1% spike alert
                 spike = detect_spike(sym, price)
                 if spike:
-                    app.create_task(
-                        app.bot.send_message(chat_id=CHAT_ID, text=spike)
-                    )
+                    safe_send(spike)
 
-                # Update history
+                # Rolling history
                 price_history[sym].append(price)
                 if len(price_history[sym]) > 200:
                     price_history[sym] = price_history[sym][-200:]
 
-                # CRT signal check (every 5 scans = ~5 mins)
+                # CRT check every 5 scans
                 if loop_count % 5 == 0:
                     sig = detect_crt_signal(sym, price)
                     if sig:
-                        app.create_task(
-                            app.bot.send_message(chat_id=CHAT_ID, text=sig)
-                        )
+                        safe_send(sig)
 
                 last_prices[sym] = price
 
-            # News check every 10 scans (~10 mins)
+            # News every 10 scans
             if loop_count % 10 == 0:
                 articles = fetch_news(3)
                 for article in articles:
                     if is_market_relevant(article["title"]):
-                        msg = (
-                            f"📰 NEWS ALERT\n\n"
+                        safe_send(
+                            f"NEWS ALERT\n\n"
                             f"{article['title']}\n\n"
                             f"{article['link']}"
-                        )
-                        app.create_task(
-                            app.bot.send_message(chat_id=CHAT_ID, text=msg)
                         )
                         sent_news_urls.add(article["link"])
 
@@ -370,30 +373,35 @@ def scanner_loop(app):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    global _event_loop, _bot_ref
+
     log.info("JARVIS STARTING...")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    _bot_ref = app.bot
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("price",  cmd_price))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("news",   cmd_news))
     app.add_handler(CommandHandler("signal", cmd_signal))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Start background scanner in a daemon thread
-    scanner_thread = threading.Thread(
-        target=scanner_loop, args=(app,), daemon=True
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    scanner_thread.start()
 
-    log.info("[TELEGRAM] Jarvis is ONLINE")
-    log.info(f"Watching: {', '.join(SYMBOLS.values())}")
+    # Capture the running event loop once telegram starts it
+    async def post_init(application):
+        global _event_loop
+        _event_loop = asyncio.get_running_loop()
+        log.info("[TELEGRAM] Jarvis is ONLINE")
+        log.info(f"Watching: {', '.join(SYMBOLS.values())}")
 
+    app.post_init = post_init
+
+    # Start scanner as daemon thread
+    threading.Thread(target=scanner_loop, daemon=True).start()
+
+    # drop_pending_updates prevents duplicate startup messages on redeploy
     app.run_polling(drop_pending_updates=True)
 
 
