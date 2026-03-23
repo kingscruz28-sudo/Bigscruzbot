@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # Strategy: CRT sweep + Malaysian Support & Resistance
 # ============================================================
 
-TELEGRAM_TOKEN = os.environ["8334034705:AAFu5K4scaO5W6LVqbqIBsBwB-2OqjkRjsI"]
-CHAT_ID = os.environ["887594990"]
+TELEGRAM_TOKEN = os.environ[8334034705:AAFu5K4scaO5W6LVqbqIBsBwB-2OqjkRjsI]
+CHAT_ID = os.environ[887594990]
 
 
 # --- CONFIG ---
