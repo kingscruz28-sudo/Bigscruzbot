@@ -8,20 +8,26 @@ import feedparser
 import anthropic
 from datetime import datetime
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict, NetworkError, TimedOut
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
+    format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
 )
 log = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-TWELVE_API_KEY    = os.environ["TWELVE_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHAT_ID           = int(os.environ["CHAT_ID"])
+ER_API_KEY        = os.environ["ER_API_KEY"]   # exchangerate-api.com key
 
 # ── Anthropic Client ──────────────────────────────────────────────────────────
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -32,23 +38,14 @@ SYMBOLS = {
     "ETH/USD": "Ethereum",
     "USD/JPY": "USD/JPY",
     "SOL/USD": "Solana",
-    "XBT/USD": "Bitcoin",
-}
-
-TWELVE_SYMBOLS = {
-    "XAU/USD": "XAU/USD",
-    "ETH/USD": "ETH/USD",
-    "USD/JPY": "USD/JPY",
-    "SOL/USD": "SOL/USD",
-    "XBT/USD": "BTC/USD",
+    "BTC/USD": "Bitcoin",
 }
 
 # ── State ─────────────────────────────────────────────────────────────────────
-price_history:  dict[str, list[float]] = {s: [] for s in SYMBOLS}
-last_prices:    dict[str, float]       = {}
-sent_news_urls: set[str]               = set()
+price_history: dict[str, list[float]] = {s: [] for s in SYMBOLS}
+last_prices: dict[str, float] = {}
+sent_news_urls: set[str] = set()
 
-# Set after the async event loop starts
 _event_loop: asyncio.AbstractEventLoop | None = None
 _bot_ref = None
 
@@ -56,8 +53,8 @@ _bot_ref = None
 # SAFE SEND  (thread -> async bridge)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def safe_send(text: str):
-    """Schedule a Telegram message from any thread."""
     if _event_loop is None or _bot_ref is None:
         log.warning("safe_send called before bot is ready")
         return
@@ -66,40 +63,80 @@ def safe_send(text: str):
         _event_loop,
     )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_price(symbol: str) -> float | None:
-    twelve_sym = TWELVE_SYMBOLS.get(symbol, symbol)
-    url = (
-        "https://api.twelvedata.com/price"
-        f"?symbol={twelve_sym}&apikey={TWELVE_API_KEY}"
-    )
+
+def fetch_crypto_prices() -> dict[str, float | None]:
+    """CoinGecko free API — ETH, SOL, BTC. No key needed."""
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=ethereum,solana,bitcoin&vs_currencies=usd",
+            timeout=10,
+        )
         data = r.json()
-        if "price" in data:
-            return float(data["price"])
-        log.warning(f"No price for {symbol}: {data}")
+        return {
+            "ETH/USD": data.get("ethereum", {}).get("usd"),
+            "SOL/USD": data.get("solana",   {}).get("usd"),
+            "BTC/USD": data.get("bitcoin",  {}).get("usd"),
+        }
     except Exception as e:
-        log.error(f"fetch_price {symbol}: {e}")
-    return None
+        log.error(f"CoinGecko error: {e}")
+        return {"ETH/USD": None, "SOL/USD": None, "BTC/USD": None}
+
+
+def fetch_forex_gold() -> dict[str, float | None]:
+    results: dict[str, float | None] = {"USD/JPY": None, "XAU/USD": None}
+
+    # USD/JPY — exchangerate-api.com with API key
+    # URL format: https://v6.exchangerate-api.com/v6/YOUR_KEY/latest/USD
+    try:
+        r = requests.get(
+            f"https://v6.exchangerate-api.com/v6/{ER_API_KEY}/latest/USD",
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("result") == "success":
+            results["USD/JPY"] = data["conversion_rates"].get("JPY")
+            log.info(f"USD/JPY from ER API: {results['USD/JPY']}")
+    except Exception as e:
+        log.error(f"ER API error: {e}")
+
+    # Gold — frankfurter.app (free, no key)
+    # Returns: {"rates": {"USD": 4186.xx}} when base=XAU
+    try:
+        r = requests.get(
+            "https://api.frankfurter.app/latest?from=XAU&to=USD",
+            timeout=10,
+        )
+        xau = r.json().get("rates", {}).get("USD")
+        if xau:
+            results["XAU/USD"] = float(xau)
+            log.info(f"XAU/USD from Frankfurter: {results['XAU/USD']}")
+    except Exception as e:
+        log.warning(f"Frankfurter gold error: {e}")
+
+    return results
 
 
 def fetch_all_prices() -> dict[str, float | None]:
-    return {sym: fetch_price(sym) for sym in SYMBOLS}
+    return {**fetch_crypto_prices(), **fetch_forex_gold()}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNAL DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def pip_size(symbol: str) -> float:
     if "JPY" in symbol:
         return 0.01
     if symbol == "XAU/USD":
         return 0.10
-    if symbol in ("ETH/USD", "SOL/USD", "XBT/USD"):
+    if symbol in ("ETH/USD", "SOL/USD", "BTC/USD"):
         return 1.0
     return 0.0001
 
@@ -118,11 +155,10 @@ def detect_crt_signal(symbol: str, price: float) -> str | None:
     ps   = pip_size(symbol)
     name = SYMBOLS[symbol]
 
-    # High sweep -> SELL
     if curr_high > prev_high and price < prev_high:
         entry = price
-        sl    = curr_high + (50 * ps)
-        tp    = entry - (150 * ps)
+        sl = curr_high + (50 * ps)
+        tp = entry - (150 * ps)
         return (
             f"SELL SIGNAL  {name}\n"
             f"High swept: {prev_high:.4f}\n"
@@ -130,11 +166,10 @@ def detect_crt_signal(symbol: str, price: float) -> str | None:
             f"150 pips target | CRT + Malaysian S/R"
         )
 
-    # Low sweep -> BUY
     if curr_low < prev_low and price > prev_low:
         entry = price
-        sl    = curr_low - (50 * ps)
-        tp    = entry + (150 * ps)
+        sl = curr_low - (50 * ps)
+        tp = entry + (150 * ps)
         return (
             f"BUY SIGNAL  {name}\n"
             f"Low swept: {prev_low:.4f}\n"
@@ -157,6 +192,7 @@ def detect_spike(symbol: str, price: float) -> str | None:
             f"Move: {pct:.2f}%  |  {last:.4f} to {price:.4f}"
         )
     return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEWS
@@ -183,7 +219,7 @@ def fetch_news(limit: int = 5) -> list[dict]:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:10]:
                 title = entry.get("title", "")
-                link  = entry.get("link", "")
+                link  = entry.get("link",  "")
                 if link and link not in sent_news_urls:
                     articles.append({"title": title, "link": link})
         except Exception as e:
@@ -193,6 +229,7 @@ def fetch_news(limit: int = 5) -> list[dict]:
 
 def is_market_relevant(title: str) -> bool:
     return any(kw in title.lower() for kw in MARKET_KEYWORDS)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI
@@ -212,8 +249,7 @@ def ask_jarvis(user_message: str, context_prices: dict | None = None) -> str:
     price_lines = ""
     if context_prices:
         lines = [
-            f"  {SYMBOLS.get(s, s)}: {p:.4f}"
-            for s, p in context_prices.items() if p
+            f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in context_prices.items() if p
         ]
         price_lines = "\nCurrent prices:\n" + "\n".join(lines)
     try:
@@ -228,9 +264,11 @@ def ask_jarvis(user_message: str, context_prices: dict | None = None) -> str:
         log.error(f"Anthropic error: {e}")
         return f"Jarvis AI error: {e}"
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -302,15 +340,30 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply  = ask_jarvis(update.message.text, prices)
     await update.message.reply_text(reply)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL ERROR HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        log.warning("Conflict: old instance shutting down. Waiting 10s...")
+        await asyncio.sleep(10)
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning(f"Network blip: {err}")
+        return
+    log.error(f"Unhandled error: {err}", exc_info=err)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND SCANNER THREAD
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def scanner_loop():
-    """
-    Daemon thread. Waits for _event_loop to be set, then scans every 60s.
-    All Telegram sends go through safe_send() -> run_coroutine_threadsafe().
-    """
     while _event_loop is None:
         time.sleep(1)
 
@@ -331,17 +384,14 @@ def scanner_loop():
                     f"| History: {len(price_history[sym])}"
                 )
 
-                # 1% spike alert
                 spike = detect_spike(sym, price)
                 if spike:
                     safe_send(spike)
 
-                # Rolling history
                 price_history[sym].append(price)
                 if len(price_history[sym]) > 200:
                     price_history[sym] = price_history[sym][-200:]
 
-                # CRT check every 5 scans
                 if loop_count % 5 == 0:
                     sig = detect_crt_signal(sym, price)
                     if sig:
@@ -349,15 +399,12 @@ def scanner_loop():
 
                 last_prices[sym] = price
 
-            # News every 10 scans
             if loop_count % 10 == 0:
                 articles = fetch_news(3)
                 for article in articles:
                     if is_market_relevant(article["title"]):
                         safe_send(
-                            f"NEWS ALERT\n\n"
-                            f"{article['title']}\n\n"
-                            f"{article['link']}"
+                            f"NEWS ALERT\n\n{article['title']}\n\n{article['link']}"
                         )
                         sent_news_urls.add(article["link"])
 
@@ -368,9 +415,11 @@ def scanner_loop():
 
         time.sleep(60)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def main():
     global _event_loop, _bot_ref
@@ -385,11 +434,10 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("news",   cmd_news))
     app.add_handler(CommandHandler("signal", cmd_signal))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Capture the running event loop once telegram starts it
+    app.add_error_handler(error_handler)
+
     async def post_init(application):
         global _event_loop
         _event_loop = asyncio.get_running_loop()
@@ -398,10 +446,8 @@ def main():
 
     app.post_init = post_init
 
-    # Start scanner as daemon thread
     threading.Thread(target=scanner_loop, daemon=True).start()
 
-    # drop_pending_updates prevents duplicate startup messages on redeploy
     app.run_polling(drop_pending_updates=True)
 
 
