@@ -25,11 +25,13 @@ log = logging.getLogger(__name__)
 
 # ── Environment Variables ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHAT_ID           = int(os.environ["CHAT_ID"])
 ER_API_KEY        = os.environ["ER_API_KEY"]
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ── Anthropic Client (optional fallback) ──────────────────────────────────────
+ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # ── Markets ───────────────────────────────────────────────────────────────────
 SYMBOLS = {
@@ -41,49 +43,32 @@ SYMBOLS = {
 }
 
 # ── Session definitions (UTC hours) ──────────────────────────────────────────
-# Sydney/Tokyo: 22:00 - 02:00 UTC
-# Asian sweep zone: 02:00 - 06:00 UTC  ← YOUR MONEY ZONE
-# London chop:  07:00 - 12:00 UTC  ← QUIET MODE
-# New York:     13:00 - 18:00 UTC  ← SECONDARY ENTRIES
-
 def get_session(utc_hour: int) -> str:
     if 2 <= utc_hour < 6:
-        return "ASIAN"       # Main money zone — Sydney high swept
+        return "ASIAN"
     elif 6 <= utc_hour < 7:
-        return "ASIAN_END"   # Transition — be cautious
+        return "ASIAN_END"
     elif 7 <= utc_hour < 13:
-        return "LONDON"      # Chop zone — quiet mode, no new signals
+        return "LONDON"
     elif 13 <= utc_hour < 18:
-        return "NEW_YORK"    # Secondary entries allowed
+        return "NEW_YORK"
     elif 22 <= utc_hour or utc_hour < 2:
-        return "SYDNEY"      # Watch for Sydney high to set up Asian sweep
+        return "SYDNEY"
     else:
-        return "DEAD"        # 18:00-22:00 UTC — no trading
+        return "DEAD"
 
-def is_signal_allowed(session: str, direction: str) -> bool:
-    """Only allow signals in zones that match your pattern."""
-    if session == "ASIAN":
-        return True           # Both directions allowed during Asian sweep
-    elif session == "NEW_YORK":
-        return True           # Secondary entries in NY
-    elif session == "LONDON":
-        return False          # London chop — no signals
-    elif session == "SYDNEY":
-        return False          # Watch only, no entries
-    elif session == "DEAD":
-        return False
-    return False
+def is_signal_allowed(session: str) -> bool:
+    return session in ("ASIAN", "NEW_YORK")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 price_history:  dict[str, list[float]] = {s: [] for s in SYMBOLS}
 last_prices:    dict[str, float]       = {}
 sent_news_urls: set[str]               = set()
+last_signal_time: dict[str, float]     = {}
+last_signal_dir:  dict[str, str]       = {}
 
-# Signal cooldown tracking — prevents flip-flopping
-last_signal_time:  dict[str, float]  = {}   # symbol -> timestamp
-last_signal_dir:   dict[str, str]    = {}   # symbol -> "BUY" or "SELL"
-SIGNAL_COOLDOWN_SECS = 1800                  # 30 min between signals per symbol
-MIN_SWEEP_PIPS = {                           # Minimum sweep size to fire signal
+SIGNAL_COOLDOWN_SECS = 1800
+MIN_SWEEP_PIPS = {
     "XAU/USD": 15.0,
     "ETH/USD": 20.0,
     "USD/JPY": 0.15,
@@ -136,8 +121,7 @@ def fetch_gold_price() -> float | None:
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
-        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        return float(price)
+        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except Exception as e:
         log.error(f"Yahoo gold error: {e}")
         return None
@@ -168,7 +152,86 @@ def fetch_all_prices() -> dict[str, float | None]:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DETECTION  (upgraded with cooldown + session + min sweep filter)
+# AI — Groq primary, Anthropic fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = (
+    "You are Jarvis, an elite AI trading assistant specialising in:\n"
+    "- CRT (Candle Range Theory) High/Low sweep strategy\n"
+    "- Malaysian S/R confluences\n"
+    "- Change in State of Delivery (CISD)\n"
+    "- Session trading: Asian sweeps (2-6am UTC), London quiet, NY entries\n"
+    "- Target: 150 pips minimum per trade on Gold\n\n"
+    "Be concise and direct. Always give entry, SL, and TP.\n"
+    "Always mention which session is active and whether it is a good time to trade."
+)
+
+
+def ask_groq(user_message: str, price_ctx: str) -> str:
+    """Primary AI — Groq (free, fast)."""
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama3-8b-8192",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"{user_message}{price_ctx}"},
+                ],
+                "max_tokens": 500,
+            },
+            timeout=15,
+        )
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        log.error(f"Groq error: {e}")
+        raise
+
+
+def ask_anthropic(user_message: str, price_ctx: str) -> str:
+    """Fallback AI — Anthropic."""
+    if not ai_client:
+        raise Exception("No Anthropic key configured")
+    resp = ai_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"{user_message}{price_ctx}"}],
+    )
+    return resp.content[0].text
+
+
+def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
+    utc_hour  = datetime.now(timezone.utc).hour
+    session   = get_session(utc_hour)
+    price_ctx = f"\nCurrent session: {session} (UTC {utc_hour}:00)\n"
+    if prices:
+        lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in prices.items() if p]
+        price_ctx += "Current prices:\n" + "\n".join(lines)
+
+    # Try Groq first
+    if GROQ_API_KEY:
+        try:
+            return ask_groq(user_message, price_ctx)
+        except Exception as e:
+            log.warning(f"Groq failed, trying Anthropic: {e}")
+
+    # Fall back to Anthropic
+    if ANTHROPIC_API_KEY:
+        try:
+            return ask_anthropic(user_message, price_ctx)
+        except Exception as e:
+            log.error(f"Anthropic also failed: {e}")
+
+    return "AI unavailable. Add GROQ_API_KEY to Railway variables (free at console.groq.com)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pip_size(symbol: str) -> float:
@@ -178,30 +241,21 @@ def pip_size(symbol: str) -> float:
     return 0.0001
 
 
-def cooldown_ok(symbol: str, direction: str) -> bool:
-    """Returns True if enough time has passed and direction hasn't just flipped."""
+def cooldown_ok(symbol: str) -> bool:
     now = time.time()
-    last_time = last_signal_time.get(symbol, 0)
-    last_dir  = last_signal_dir.get(symbol, "")
-
-    # Cooldown not expired
-    if now - last_time < SIGNAL_COOLDOWN_SECS:
-        return False
-
-    return True
+    return now - last_signal_time.get(symbol, 0) >= SIGNAL_COOLDOWN_SECS
 
 
 def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
-    # Session gate
-    if not is_signal_allowed(session, ""):
+    if not is_signal_allowed(session):
         return None
 
     history = price_history[symbol]
     if len(history) < 20:
         return None
 
-    recent   = history[-5:]
-    lookback = history[-20:-5]
+    recent    = history[-5:]
+    lookback  = history[-20:-5]
     prev_high = max(lookback)
     prev_low  = min(lookback)
     curr_high = max(recent)
@@ -211,37 +265,35 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
     min_sweep = MIN_SWEEP_PIPS.get(symbol, 10.0)
 
     # HIGH SWEEP → SELL
-    sweep_size_high = (curr_high - prev_high) / ps
-    if curr_high > prev_high and price < prev_high and sweep_size_high >= min_sweep:
-        if cooldown_ok(symbol, "SELL"):
+    sweep_high = (curr_high - prev_high) / ps
+    if curr_high > prev_high and price < prev_high and sweep_high >= min_sweep:
+        if cooldown_ok(symbol):
             entry = price
             sl    = curr_high + (50 * ps)
             tp    = entry - (150 * ps)
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "SELL"
-            session_tag = f" [{session} SESSION]"
             return (
-                f"SELL SIGNAL  {name}{session_tag}\n"
-                f"High swept: {prev_high:.4f} ({sweep_size_high:.0f} pips)\n"
+                f"SELL SIGNAL  {name} [{session}]\n"
+                f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
                 f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"150 pips target | CRT + Malaysian S/R"
+                f"150 pips | CRT + Malaysian S/R"
             )
 
     # LOW SWEEP → BUY
-    sweep_size_low = (prev_low - curr_low) / ps
-    if curr_low < prev_low and price > prev_low and sweep_size_low >= min_sweep:
-        if cooldown_ok(symbol, "BUY"):
+    sweep_low = (prev_low - curr_low) / ps
+    if curr_low < prev_low and price > prev_low and sweep_low >= min_sweep:
+        if cooldown_ok(symbol):
             entry = price
             sl    = curr_low - (50 * ps)
             tp    = entry + (150 * ps)
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "BUY"
-            session_tag = f" [{session} SESSION]"
             return (
-                f"BUY SIGNAL  {name}{session_tag}\n"
-                f"Low swept: {prev_low:.4f} ({sweep_size_low:.0f} pips)\n"
+                f"BUY SIGNAL  {name} [{session}]\n"
+                f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
                 f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"150 pips target | CRT + Malaysian S/R"
+                f"150 pips | CRT + Malaysian S/R"
             )
 
     return None
@@ -296,41 +348,6 @@ def is_market_relevant(title: str) -> bool:
     return any(kw in title.lower() for kw in MARKET_KEYWORDS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI
-# ─────────────────────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = (
-    "You are Jarvis, an elite AI trading assistant specialising in:\n"
-    "- CRT (Candle Range Theory) High/Low sweep strategy\n"
-    "- Malaysian S/R confluences\n"
-    "- Change in State of Delivery (CISD)\n"
-    "- Session-based trading: Asian sweeps (2-6am UTC), London quiet, NY entries\n"
-    "- Target: 150 pips minimum per trade on Gold\n\n"
-    "Be concise and direct. Always give entry, SL, and TP.\n"
-    "Always mention which session is active and whether it's a good time to trade."
-)
-
-
-def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
-    utc_hour = datetime.now(timezone.utc).hour
-    session  = get_session(utc_hour)
-    price_ctx = f"\nCurrent session: {session} (UTC {utc_hour}:00)\n"
-    if prices:
-        lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in prices.items() if p]
-        price_ctx += "Current prices:\n" + "\n".join(lines)
-    try:
-        resp = ai_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"{user_message}{price_ctx}"}],
-        )
-        return resp.content[0].text
-    except Exception as e:
-        log.error(f"AI error: {e}")
-        return f"Jarvis AI error: {e}"
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -340,15 +357,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Jarvis online.\n"
         f"Current session: {session}\n\n"
-        f"Watching: Gold, ETH, USD/JPY, SOL, BTC\n\n"
         f"Signal zones:\n"
         f"  ASIAN 02:00-06:00 UTC = ACTIVE\n"
         f"  LONDON 07:00-13:00 UTC = QUIET\n"
         f"  NEW YORK 13:00-18:00 UTC = ACTIVE\n\n"
-        f"/price  - current prices\n"
-        f"/status - bot status\n"
-        f"/news   - latest market news\n"
-        f"/signal - manual CRT scan\n"
+        f"/price   - current prices\n"
+        f"/status  - bot status\n"
+        f"/news    - market news\n"
+        f"/signal  - manual CRT scan\n"
         f"/session - current session info\n"
         f"Or ask me anything."
     )
@@ -358,17 +374,17 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     utc_hour = datetime.now(timezone.utc).hour
     session  = get_session(utc_hour)
     advice = {
-        "ASIAN":     "ACTIVE - Watch for Sydney high sweeps. Clean entries available.",
-        "ASIAN_END": "TRANSITION - Asian session ending. Be cautious.",
-        "LONDON":    "QUIET MODE - London manipulates. No new entries. Manage existing trades only.",
+        "ASIAN":     "ACTIVE - Asian session. Watch for Sydney high sweeps. Clean entries.",
+        "ASIAN_END": "TRANSITION - Asian ending. Be cautious.",
+        "LONDON":    "QUIET MODE - London chop. No new entries. Manage existing trades only.",
         "NEW_YORK":  "ACTIVE - NY session. Secondary entries if trend confirms.",
-        "SYDNEY":    "WATCH ONLY - Sydney setting up. Look for highs that may get swept in Asia.",
+        "SYDNEY":    "WATCH ONLY - Sydney setting up highs for Asian sweep.",
         "DEAD":      "DEAD ZONE - No trading. Rest.",
     }
     await update.message.reply_text(
-        f"Current Session: {session}\n"
-        f"UTC Time: {utc_hour:02d}:00\n\n"
-        f"{advice.get(session, 'Unknown session')}"
+        f"Session: {session}\n"
+        f"UTC: {utc_hour:02d}:00\n\n"
+        f"{advice.get(session, 'Unknown')}"
     )
 
 
@@ -386,12 +402,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session  = get_session(utc_hour)
     n        = sum(1 for p in last_prices.values() if p)
     depth    = len(price_history.get("XAU/USD", []))
+    ai_status = "Groq" if GROQ_API_KEY else ("Anthropic" if ANTHROPIC_API_KEY else "NONE")
     await update.message.reply_text(
         f"Jarvis Status\n"
         f"Session: {session}\n"
-        f"Active markets: {n}/{len(SYMBOLS)}\n"
-        f"History depth: {depth} candles\n"
-        f"News tracked: {len(sent_news_urls)}\n"
+        f"AI: {ai_status}\n"
+        f"Markets: {n}/{len(SYMBOLS)}\n"
+        f"History: {depth} candles\n"
         f"Status: RUNNING"
     )
 
@@ -410,17 +427,17 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     utc_hour = datetime.now(timezone.utc).hour
     session  = get_session(utc_hour)
-    prices   = fetch_all_prices()
-    found    = []
 
-    if session in ("LONDON", "DEAD", "SYDNEY"):
+    if not is_signal_allowed(session):
         await update.message.reply_text(
             f"Session: {session}\n"
             f"No signals during this session.\n"
-            f"Next active window: Asian (02:00 UTC) or NY (13:00 UTC)"
+            f"Active windows: Asian 02:00-06:00 UTC or NY 13:00-18:00 UTC"
         )
         return
 
+    prices = fetch_all_prices()
+    found  = []
     for sym, price in prices.items():
         if price is None:
             continue
@@ -450,7 +467,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        log.warning("Conflict: old instance shutting down. Waiting 10s...")
+        log.warning("Conflict: waiting 10s...")
         await asyncio.sleep(10)
         return
     if isinstance(err, (NetworkError, TimedOut)):
@@ -467,13 +484,28 @@ def scanner_loop():
         time.sleep(1)
 
     loop_count = 0
+    prev_session = None
+
     while True:
         try:
             utc_hour = datetime.now(timezone.utc).hour
             session  = get_session(utc_hour)
             now      = datetime.utcnow().strftime("%H:%M:%S")
 
-            log.info(f"[{now}] Scanning... Session: {session}")
+            log.info(f"[{now}] Session: {session}")
+
+            # Session change notification
+            if session != prev_session and prev_session is not None:
+                messages = {
+                    "ASIAN":    "ASIAN SESSION OPEN\nWatch for Sydney high sweeps. Gold focus. Clean entries.",
+                    "NEW_YORK": "NEW YORK SESSION OPEN\nSecondary entries. Confirm trend before entering.",
+                    "LONDON":   "LONDON SESSION\nQuiet mode ON. No new signals. Manage existing trades only.",
+                    "DEAD":     "Markets closing. Rest up.",
+                }
+                msg = messages.get(session)
+                if msg:
+                    safe_send(msg)
+            prev_session = session
 
             prices = fetch_all_prices()
 
@@ -481,13 +513,8 @@ def scanner_loop():
                 if price is None:
                     continue
 
-                log.info(
-                    f"  [{sym}] {SYMBOLS[sym]}: {price:,.4f}"
-                    f" | History: {len(price_history[sym])}"
-                    f" | Session: {session}"
-                )
+                log.info(f"  [{sym}] {SYMBOLS[sym]}: {price:,.4f} | {session}")
 
-                # Spike alerts always fire regardless of session
                 spike = detect_spike(sym, price)
                 if spike:
                     safe_send(spike)
@@ -496,32 +523,19 @@ def scanner_loop():
                 if len(price_history[sym]) > 200:
                     price_history[sym] = price_history[sym][-200:]
 
-                # CRT signals only in active sessions
-                if loop_count % 5 == 0 and session in ("ASIAN", "NEW_YORK"):
+                if loop_count % 5 == 0 and is_signal_allowed(session):
                     sig = detect_crt_signal(sym, price, session)
                     if sig:
                         safe_send(sig)
 
                 last_prices[sym] = price
 
-            # News every 10 scans
             if loop_count % 10 == 0:
                 articles = fetch_news(3)
                 for article in articles:
                     if is_market_relevant(article["title"]):
-                        safe_send(
-                            f"NEWS ALERT\n\n{article['title']}\n\n{article['link']}"
-                        )
+                        safe_send(f"NEWS\n\n{article['title']}\n{article['link']}")
                         sent_news_urls.add(article["link"])
-
-            # Session change announcements
-            if loop_count % 60 == 0:
-                if session == "ASIAN":
-                    safe_send("ASIAN SESSION ACTIVE\nWatch for Sydney high sweeps. Clean entries available. Gold focus.")
-                elif session == "NEW_YORK":
-                    safe_send("NEW YORK SESSION ACTIVE\nSecondary entries open. Confirm trend before entering.")
-                elif session == "LONDON":
-                    safe_send("LONDON SESSION\nQuiet mode. No new signals. Manage existing trades only.")
 
             loop_count += 1
 
@@ -555,12 +569,10 @@ def main():
         global _event_loop
         _event_loop = asyncio.get_running_loop()
         log.info("[TELEGRAM] Jarvis is ONLINE")
-        log.info(f"Watching: {', '.join(SYMBOLS.values())}")
 
     app.post_init = post_init
 
     threading.Thread(target=scanner_loop, daemon=True).start()
-
     app.run_polling(drop_pending_updates=True)
 
 
