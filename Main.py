@@ -6,7 +6,7 @@ import threading
 import requests
 import feedparser
 import anthropic
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
@@ -29,7 +29,6 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHAT_ID           = int(os.environ["CHAT_ID"])
 ER_API_KEY        = os.environ["ER_API_KEY"]
 
-# ── Anthropic Client ──────────────────────────────────────────────────────────
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── Markets ───────────────────────────────────────────────────────────────────
@@ -41,36 +40,77 @@ SYMBOLS = {
     "BTC/USD": "Bitcoin",
 }
 
-# ── State ─────────────────────────────────────────────────────────────────────
-price_history: dict[str, list[float]] = {s: [] for s in SYMBOLS}
-last_prices: dict[str, float] = {}
-sent_news_urls: set[str] = set()
+# ── Session definitions (UTC hours) ──────────────────────────────────────────
+# Sydney/Tokyo: 22:00 - 02:00 UTC
+# Asian sweep zone: 02:00 - 06:00 UTC  ← YOUR MONEY ZONE
+# London chop:  07:00 - 12:00 UTC  ← QUIET MODE
+# New York:     13:00 - 18:00 UTC  ← SECONDARY ENTRIES
 
-_event_loop: asyncio.AbstractEventLoop | None = None
-_bot_ref = None
+def get_session(utc_hour: int) -> str:
+    if 2 <= utc_hour < 6:
+        return "ASIAN"       # Main money zone — Sydney high swept
+    elif 6 <= utc_hour < 7:
+        return "ASIAN_END"   # Transition — be cautious
+    elif 7 <= utc_hour < 13:
+        return "LONDON"      # Chop zone — quiet mode, no new signals
+    elif 13 <= utc_hour < 18:
+        return "NEW_YORK"    # Secondary entries allowed
+    elif 22 <= utc_hour or utc_hour < 2:
+        return "SYDNEY"      # Watch for Sydney high to set up Asian sweep
+    else:
+        return "DEAD"        # 18:00-22:00 UTC — no trading
+
+def is_signal_allowed(session: str, direction: str) -> bool:
+    """Only allow signals in zones that match your pattern."""
+    if session == "ASIAN":
+        return True           # Both directions allowed during Asian sweep
+    elif session == "NEW_YORK":
+        return True           # Secondary entries in NY
+    elif session == "LONDON":
+        return False          # London chop — no signals
+    elif session == "SYDNEY":
+        return False          # Watch only, no entries
+    elif session == "DEAD":
+        return False
+    return False
+
+# ── State ─────────────────────────────────────────────────────────────────────
+price_history:  dict[str, list[float]] = {s: [] for s in SYMBOLS}
+last_prices:    dict[str, float]       = {}
+sent_news_urls: set[str]               = set()
+
+# Signal cooldown tracking — prevents flip-flopping
+last_signal_time:  dict[str, float]  = {}   # symbol -> timestamp
+last_signal_dir:   dict[str, str]    = {}   # symbol -> "BUY" or "SELL"
+SIGNAL_COOLDOWN_SECS = 1800                  # 30 min between signals per symbol
+MIN_SWEEP_PIPS = {                           # Minimum sweep size to fire signal
+    "XAU/USD": 15.0,
+    "ETH/USD": 20.0,
+    "USD/JPY": 0.15,
+    "SOL/USD": 0.50,
+    "BTC/USD": 200.0,
+}
+
+_event_loop = None
+_bot_ref    = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SAFE SEND
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def safe_send(text: str):
     if _event_loop is None or _bot_ref is None:
-        log.warning("safe_send called before bot is ready")
         return
     asyncio.run_coroutine_threadsafe(
         _bot_ref.send_message(chat_id=CHAT_ID, text=text),
         _event_loop,
     )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def fetch_crypto_prices() -> dict[str, float | None]:
-    """CoinGecko free API — ETH, SOL, BTC."""
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price"
@@ -89,7 +129,6 @@ def fetch_crypto_prices() -> dict[str, float | None]:
 
 
 def fetch_gold_price() -> float | None:
-    """Yahoo Finance GC=F (Gold Futures) — free, no key needed."""
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF"
@@ -97,12 +136,7 @@ def fetch_gold_price() -> float | None:
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
-        data = r.json()
-        price = (
-            data["chart"]["result"][0]
-            ["meta"]["regularMarketPrice"]
-        )
-        log.info(f"XAU/USD from Yahoo Finance: {price}")
+        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
         return float(price)
     except Exception as e:
         log.error(f"Yahoo gold error: {e}")
@@ -110,7 +144,6 @@ def fetch_gold_price() -> float | None:
 
 
 def fetch_usdjpy_price() -> float | None:
-    """ER API for USD/JPY."""
     try:
         r = requests.get(
             f"https://v6.exchangerate-api.com/v6/{ER_API_KEY}/latest/USD",
@@ -118,10 +151,7 @@ def fetch_usdjpy_price() -> float | None:
         )
         data = r.json()
         if data.get("result") == "success":
-            jpy = data["conversion_rates"].get("JPY")
-            if jpy:
-                log.info(f"USD/JPY from ER API: {jpy}")
-                return float(jpy)
+            return float(data["conversion_rates"].get("JPY", 0)) or None
     except Exception as e:
         log.error(f"ER API error: {e}")
     return None
@@ -137,23 +167,35 @@ def fetch_all_prices() -> dict[str, float | None]:
         "BTC/USD": crypto.get("BTC/USD"),
     }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DETECTION
+# SIGNAL DETECTION  (upgraded with cooldown + session + min sweep filter)
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def pip_size(symbol: str) -> float:
-    if "JPY" in symbol:
-        return 0.01
-    if symbol == "XAU/USD":
-        return 0.10
-    if symbol in ("ETH/USD", "SOL/USD", "BTC/USD"):
-        return 1.0
+    if "JPY" in symbol:       return 0.01
+    if symbol == "XAU/USD":   return 0.10
+    if symbol in ("ETH/USD", "SOL/USD", "BTC/USD"): return 1.0
     return 0.0001
 
 
-def detect_crt_signal(symbol: str, price: float) -> str | None:
+def cooldown_ok(symbol: str, direction: str) -> bool:
+    """Returns True if enough time has passed and direction hasn't just flipped."""
+    now = time.time()
+    last_time = last_signal_time.get(symbol, 0)
+    last_dir  = last_signal_dir.get(symbol, "")
+
+    # Cooldown not expired
+    if now - last_time < SIGNAL_COOLDOWN_SECS:
+        return False
+
+    return True
+
+
+def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
+    # Session gate
+    if not is_signal_allowed(session, ""):
+        return None
+
     history = price_history[symbol]
     if len(history) < 20:
         return None
@@ -164,30 +206,43 @@ def detect_crt_signal(symbol: str, price: float) -> str | None:
     prev_low  = min(lookback)
     curr_high = max(recent)
     curr_low  = min(recent)
-    ps   = pip_size(symbol)
-    name = SYMBOLS[symbol]
+    ps        = pip_size(symbol)
+    name      = SYMBOLS[symbol]
+    min_sweep = MIN_SWEEP_PIPS.get(symbol, 10.0)
 
-    if curr_high > prev_high and price < prev_high:
-        entry = price
-        sl = curr_high + (50 * ps)
-        tp = entry - (150 * ps)
-        return (
-            f"SELL SIGNAL  {name}\n"
-            f"High swept: {prev_high:.4f}\n"
-            f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-            f"150 pips target | CRT + Malaysian S/R"
-        )
+    # HIGH SWEEP → SELL
+    sweep_size_high = (curr_high - prev_high) / ps
+    if curr_high > prev_high and price < prev_high and sweep_size_high >= min_sweep:
+        if cooldown_ok(symbol, "SELL"):
+            entry = price
+            sl    = curr_high + (50 * ps)
+            tp    = entry - (150 * ps)
+            last_signal_time[symbol] = time.time()
+            last_signal_dir[symbol]  = "SELL"
+            session_tag = f" [{session} SESSION]"
+            return (
+                f"SELL SIGNAL  {name}{session_tag}\n"
+                f"High swept: {prev_high:.4f} ({sweep_size_high:.0f} pips)\n"
+                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                f"150 pips target | CRT + Malaysian S/R"
+            )
 
-    if curr_low < prev_low and price > prev_low:
-        entry = price
-        sl = curr_low - (50 * ps)
-        tp = entry + (150 * ps)
-        return (
-            f"BUY SIGNAL  {name}\n"
-            f"Low swept: {prev_low:.4f}\n"
-            f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-            f"150 pips target | CRT + Malaysian S/R"
-        )
+    # LOW SWEEP → BUY
+    sweep_size_low = (prev_low - curr_low) / ps
+    if curr_low < prev_low and price > prev_low and sweep_size_low >= min_sweep:
+        if cooldown_ok(symbol, "BUY"):
+            entry = price
+            sl    = curr_low - (50 * ps)
+            tp    = entry + (150 * ps)
+            last_signal_time[symbol] = time.time()
+            last_signal_dir[symbol]  = "BUY"
+            session_tag = f" [{session} SESSION]"
+            return (
+                f"BUY SIGNAL  {name}{session_tag}\n"
+                f"Low swept: {prev_low:.4f} ({sweep_size_low:.0f} pips)\n"
+                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                f"150 pips target | CRT + Malaysian S/R"
+            )
 
     return None
 
@@ -200,11 +255,10 @@ def detect_spike(symbol: str, price: float) -> str | None:
     if pct >= 1.0:
         arrow = "UP" if price > last else "DOWN"
         return (
-            f"PRICE SPIKE {arrow}  {SYMBOLS[symbol]}\n"
-            f"Move: {pct:.2f}%  |  {last:.4f} to {price:.4f}"
+            f"SPIKE {arrow}  {SYMBOLS[symbol]}\n"
+            f"{pct:.2f}% move  |  {last:.4f} to {price:.4f}"
         )
     return None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEWS
@@ -215,7 +269,6 @@ NEWS_FEEDS = [
     "https://www.forexlive.com/feed/news",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
 ]
-
 MARKET_KEYWORDS = [
     "gold", "bitcoin", "btc", "ethereum", "eth", "solana",
     "usd/jpy", "dollar", "yen", "fed", "fomc", "inflation",
@@ -226,22 +279,21 @@ MARKET_KEYWORDS = [
 
 def fetch_news(limit: int = 5) -> list[dict]:
     articles = []
-    for feed_url in NEWS_FEEDS:
+    for url in NEWS_FEEDS:
         try:
-            feed = feedparser.parse(feed_url)
+            feed = feedparser.parse(url)
             for entry in feed.entries[:10]:
                 title = entry.get("title", "")
                 link  = entry.get("link",  "")
                 if link and link not in sent_news_urls:
                     articles.append({"title": title, "link": link})
         except Exception as e:
-            log.error(f"News feed error ({feed_url}): {e}")
+            log.error(f"News error: {e}")
     return articles[:limit]
 
 
 def is_market_relevant(title: str) -> bool:
     return any(kw in title.lower() for kw in MARKET_KEYWORDS)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI
@@ -251,52 +303,78 @@ SYSTEM_PROMPT = (
     "You are Jarvis, an elite AI trading assistant specialising in:\n"
     "- CRT (Candle Range Theory) High/Low sweep strategy\n"
     "- Malaysian S/R confluences\n"
-    "- Forex, Gold, Crypto, and indices\n"
-    "- Target: 100-150 pips minimum per trade\n\n"
-    "Be concise and direct. Always give entry, SL, and TP when discussing trades."
+    "- Change in State of Delivery (CISD)\n"
+    "- Session-based trading: Asian sweeps (2-6am UTC), London quiet, NY entries\n"
+    "- Target: 150 pips minimum per trade on Gold\n\n"
+    "Be concise and direct. Always give entry, SL, and TP.\n"
+    "Always mention which session is active and whether it's a good time to trade."
 )
 
 
-def ask_jarvis(user_message: str, context_prices: dict | None = None) -> str:
-    price_lines = ""
-    if context_prices:
-        lines = [
-            f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in context_prices.items() if p
-        ]
-        price_lines = "\nCurrent prices:\n" + "\n".join(lines)
+def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
+    utc_hour = datetime.now(timezone.utc).hour
+    session  = get_session(utc_hour)
+    price_ctx = f"\nCurrent session: {session} (UTC {utc_hour}:00)\n"
+    if prices:
+        lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in prices.items() if p]
+        price_ctx += "Current prices:\n" + "\n".join(lines)
     try:
         resp = ai_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"{user_message}{price_lines}"}],
+            messages=[{"role": "user", "content": f"{user_message}{price_ctx}"}],
         )
         return resp.content[0].text
     except Exception as e:
-        log.error(f"Anthropic error: {e}")
+        log.error(f"AI error: {e}")
         return f"Jarvis AI error: {e}"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    utc_hour = datetime.now(timezone.utc).hour
+    session  = get_session(utc_hour)
     await update.message.reply_text(
-        "Jarvis online.\n"
-        "Watching: Gold, ETH, USD/JPY, SOL, BTC\n\n"
-        "/price  - current prices\n"
-        "/status - bot status\n"
-        "/news   - latest market news\n"
-        "/signal - scan for CRT setups\n"
-        "Or ask me anything."
+        f"Jarvis online.\n"
+        f"Current session: {session}\n\n"
+        f"Watching: Gold, ETH, USD/JPY, SOL, BTC\n\n"
+        f"Signal zones:\n"
+        f"  ASIAN 02:00-06:00 UTC = ACTIVE\n"
+        f"  LONDON 07:00-13:00 UTC = QUIET\n"
+        f"  NEW YORK 13:00-18:00 UTC = ACTIVE\n\n"
+        f"/price  - current prices\n"
+        f"/status - bot status\n"
+        f"/news   - latest market news\n"
+        f"/signal - manual CRT scan\n"
+        f"/session - current session info\n"
+        f"Or ask me anything."
+    )
+
+
+async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    utc_hour = datetime.now(timezone.utc).hour
+    session  = get_session(utc_hour)
+    advice = {
+        "ASIAN":     "ACTIVE - Watch for Sydney high sweeps. Clean entries available.",
+        "ASIAN_END": "TRANSITION - Asian session ending. Be cautious.",
+        "LONDON":    "QUIET MODE - London manipulates. No new entries. Manage existing trades only.",
+        "NEW_YORK":  "ACTIVE - NY session. Secondary entries if trend confirms.",
+        "SYDNEY":    "WATCH ONLY - Sydney setting up. Look for highs that may get swept in Asia.",
+        "DEAD":      "DEAD ZONE - No trading. Rest.",
+    }
+    await update.message.reply_text(
+        f"Current Session: {session}\n"
+        f"UTC Time: {utc_hour:02d}:00\n\n"
+        f"{advice.get(session, 'Unknown session')}"
     )
 
 
 async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices = fetch_all_prices()
-    lines = ["Current Prices:"]
+    lines  = ["Current Prices:"]
     for sym, price in prices.items():
         val = f"{price:,.4f}" if price else "unavailable"
         lines.append(f"  {SYMBOLS[sym]}: {val}")
@@ -304,13 +382,16 @@ async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    n     = sum(1 for p in last_prices.values() if p)
-    depth = len(price_history.get("XAU/USD", []))
+    utc_hour = datetime.now(timezone.utc).hour
+    session  = get_session(utc_hour)
+    n        = sum(1 for p in last_prices.values() if p)
+    depth    = len(price_history.get("XAU/USD", []))
     await update.message.reply_text(
         f"Jarvis Status\n"
+        f"Session: {session}\n"
         f"Active markets: {n}/{len(SYMBOLS)}\n"
-        f"History depth:  {depth} candles\n"
-        f"News tracked:   {len(sent_news_urls)} articles\n"
+        f"History depth: {depth} candles\n"
+        f"News tracked: {len(sent_news_urls)}\n"
         f"Status: RUNNING"
     )
 
@@ -327,23 +408,36 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    prices = fetch_all_prices()
-    found  = []
+    utc_hour = datetime.now(timezone.utc).hour
+    session  = get_session(utc_hour)
+    prices   = fetch_all_prices()
+    found    = []
+
+    if session in ("LONDON", "DEAD", "SYDNEY"):
+        await update.message.reply_text(
+            f"Session: {session}\n"
+            f"No signals during this session.\n"
+            f"Next active window: Asian (02:00 UTC) or NY (13:00 UTC)"
+        )
+        return
+
     for sym, price in prices.items():
         if price is None:
             continue
         price_history[sym].append(price)
-        sig = detect_crt_signal(sym, price)
+        sig = detect_crt_signal(sym, price, session)
         if sig:
             found.append(sig)
+
     if found:
         for sig in found:
             await update.message.reply_text(sig)
     else:
         depth = len(price_history.get("XAU/USD", []))
         await update.message.reply_text(
-            f"No CRT setups detected.\n"
-            f"History: {depth}/20 candles. Markets may be ranging."
+            f"Session: {session}\n"
+            f"No CRT setups right now.\n"
+            f"History: {depth}/20 candles."
         )
 
 
@@ -351,11 +445,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices = fetch_all_prices()
     reply  = ask_jarvis(update.message.text, prices)
     await update.message.reply_text(reply)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ERROR HANDLER
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -369,11 +458,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         return
     log.error(f"Unhandled error: {err}", exc_info=err)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def scanner_loop():
     while _event_loop is None:
@@ -382,8 +469,11 @@ def scanner_loop():
     loop_count = 0
     while True:
         try:
-            now = datetime.utcnow().strftime("%H:%M:%S")
-            log.info(f"[{now}] Scanning...")
+            utc_hour = datetime.now(timezone.utc).hour
+            session  = get_session(utc_hour)
+            now      = datetime.utcnow().strftime("%H:%M:%S")
+
+            log.info(f"[{now}] Scanning... Session: {session}")
 
             prices = fetch_all_prices()
 
@@ -392,10 +482,12 @@ def scanner_loop():
                     continue
 
                 log.info(
-                    f"  [{sym}] {SYMBOLS[sym]}: {price:,.4f} "
-                    f"| History: {len(price_history[sym])}"
+                    f"  [{sym}] {SYMBOLS[sym]}: {price:,.4f}"
+                    f" | History: {len(price_history[sym])}"
+                    f" | Session: {session}"
                 )
 
+                # Spike alerts always fire regardless of session
                 spike = detect_spike(sym, price)
                 if spike:
                     safe_send(spike)
@@ -404,13 +496,15 @@ def scanner_loop():
                 if len(price_history[sym]) > 200:
                     price_history[sym] = price_history[sym][-200:]
 
-                if loop_count % 5 == 0:
-                    sig = detect_crt_signal(sym, price)
+                # CRT signals only in active sessions
+                if loop_count % 5 == 0 and session in ("ASIAN", "NEW_YORK"):
+                    sig = detect_crt_signal(sym, price, session)
                     if sig:
                         safe_send(sig)
 
                 last_prices[sym] = price
 
+            # News every 10 scans
             if loop_count % 10 == 0:
                 articles = fetch_news(3)
                 for article in articles:
@@ -420,6 +514,15 @@ def scanner_loop():
                         )
                         sent_news_urls.add(article["link"])
 
+            # Session change announcements
+            if loop_count % 60 == 0:
+                if session == "ASIAN":
+                    safe_send("ASIAN SESSION ACTIVE\nWatch for Sydney high sweeps. Clean entries available. Gold focus.")
+                elif session == "NEW_YORK":
+                    safe_send("NEW YORK SESSION ACTIVE\nSecondary entries open. Confirm trend before entering.")
+                elif session == "LONDON":
+                    safe_send("LONDON SESSION\nQuiet mode. No new signals. Manage existing trades only.")
+
             loop_count += 1
 
         except Exception as e:
@@ -427,11 +530,9 @@ def scanner_loop():
 
         time.sleep(60)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def main():
     global _event_loop, _bot_ref
@@ -441,13 +542,13 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     _bot_ref = app.bot
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("price",  cmd_price))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("news",   cmd_news))
-    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("price",   cmd_price))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("news",    cmd_news))
+    app.add_handler(CommandHandler("signal",  cmd_signal))
+    app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.add_error_handler(error_handler)
 
     async def post_init(application):
