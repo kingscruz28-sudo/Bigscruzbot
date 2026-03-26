@@ -20,7 +20,7 @@ ContextTypes,
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-format=”%(asctime)s [%(levelname)s] %(message)s”, level=logging.INFO
+format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
 )
 log = logging.getLogger(**name**)
 
