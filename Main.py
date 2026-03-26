@@ -7,6 +7,7 @@ import requests
 import feedparser
 import anthropic
 import base64
+import random
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -110,40 +111,90 @@ def get_greeting_period(utc_hour: int) -> str:
         return "night"
 
 
+# ── Motivational quotes — fire these at random ───────────────────────────────
+MOTIVATIONAL_QUOTES = [
+    "💡 \"The market rewards patience and punishes impatience.\" — sit tight, boss.",
+    "🔥 \"Discipline is doing what needs to be done, even when you don't want to.\" Trade the plan.",
+    "⚡ \"Amateurs want to be right. Professionals want to make money.\" Know the difference.",
+    "🎯 \"One good trade is worth more than ten rushed ones.\" Quality over quantity.",
+    "🧘 \"The best trade is sometimes no trade at all.\" Dead zone = rest zone.",
+    "💎 \"Protect the capital first. Profits come second.\" SL is your best friend.",
+    "🌊 \"Don't fight the session. Flow with it.\" Asian sweeps are your bread and butter.",
+    "🏆 \"Every loss is tuition. Every win is proof the system works.\" Keep studying.",
+    "🔑 \"Consistency beats luck every single time.\" Show up every session.",
+    "🚀 \"Small pips compound into life-changing money.\" 150 pips a day keeps the losses away.",
+    "🦁 \"The market is a lion. Respect it and it feeds you. Disrespect it and it eats you.\"",
+    "⏰ \"Timing is everything. The Asian session doesn't lie.\" 02:00 UTC is your hour.",
+    "📊 \"A trading plan without discipline is just a wish list.\" Execute, boss.",
+    "🌙 \"While others sleep, the Asian market sets up your next move.\" Eyes open at 02:00.",
+    "💪 \"Losses don't define you. How you respond to them does.\" Reset and reload.",
+    "🎲 \"Trading without a stop loss is gambling. You're not a gambler, you're a trader.\"",
+    "🧠 \"Your biggest enemy in trading is between your ears.\" Stay calm, stay sharp.",
+    "📈 \"The CRT sweep doesn't lie. Price always revisits liquidity.\" Trust the method.",
+]
+
+# ── Names Jarvis calls you — rotates so it never feels robotic ────────────────
+BOSS_NAMES = [
+    "Scruz", "Bigscruz", "Deej", "Scru", "BigDawg", "Boss", "Scruman",
+]
+_last_name_used = ""
+
+def get_name() -> str:
+    """Pick a random name, never repeat the same one twice in a row."""
+    global _last_name_used
+    choices = [n for n in BOSS_NAMES if n != _last_name_used]
+    name = random.choice(choices)
+    _last_name_used = name
+    return name
+
+# ── Boss names — Jarvis knows who he's talking to ────────────────────────────
+BOSS_NAMES = [
+    "Scruz", "Bigscruz", "Deej", "Scru", "BigDawg",
+    "boss", "boss", "boss",  # weighted so "boss" still comes up naturally
+    "The One and Only",
+]
+
+def get_boss_name() -> str:
+    return random.choice(BOSS_NAMES)
+
+
 def build_greeting(utc_hour: int) -> str:
     """Build a time-appropriate greeting with session tip."""
     period = get_greeting_period(utc_hour)
     session = get_session(utc_hour)
 
+    name = get_boss_name()
+
     greetings = {
         "morning": (
-            "🌅 Good morning, boss.\n"
-            "Asian session winding down. Review overnight sweeps on Gold.\n"
-            "London opens soon — stay cautious, let price settle.\n"
-            "Trading pattern: CRT + Malaysian S/R + CISD"
+            f"🌅 Good morning, {name}.\n"
+            "Asian session is winding down — review any overnight sweeps on Gold.\n"
+            "London opens soon. Stay cautious, let price settle before touching anything.\n"
+            "Pattern: CRT + Malaysian S/R + CISD. You know the drill."
         ),
         "afternoon": (
-            "☀️ Good afternoon.\n"
-            "NY session is active. Secondary entries only — confirm the trend.\n"
-            "Watch for Gold and crypto setups. 150 pip minimum target.\n"
-            "Trading pattern: CRT + Malaysian S/R + CISD"
+            f"☀️ Good afternoon, {name}.\n"
+            "NY session is live. Secondary entries only — confirm the trend first, don't chase.\n"
+            "Gold and crypto setups are on watch. 150 pip minimum, no exceptions.\n"
+            "Stay sharp and trust the levels."
         ),
         "evening": (
-            "🌆 Good evening.\n"
-            "NY session closing. Manage open trades, don't open new ones.\n"
-            "Asian session sets up in a few hours — get some rest.\n"
-            "Trading pattern: CRT + Malaysian S/R + CISD"
+            f"🌆 Good evening, {name}.\n"
+            "NY session is wrapping up. If you have open trades, manage them — don't open new positions.\n"
+            "Asian session sets up in a few hours. Rest up, recharge.\n"
+            "The market will still be there tomorrow."
         ),
         "night": (
-            "🌙 Good night, boss.\n"
-            "Dead zone — no trading. Let the market breathe.\n"
-            "Asian session opens 02:00 UTC. Sydney will set the highs to sweep.\n"
-            "Rest up. Sharp mind = sharp entries."
+            f"🌙 Good night, {name}.\n"
+            "Dead zone — no trading. Let the market breathe and so should you.\n"
+            "Asian session opens 02:00 UTC. Sydney is setting up the highs that get swept.\n"
+            "Sharp mind = sharp entries. Rest is part of the strategy."
         ),
     }
 
+    quote = random.choice(MOTIVATIONAL_QUOTES)
     msg = greetings.get(period, "Jarvis online.")
-    msg += f"\n\nCurrent session: {session}"
+    msg += f"\n\nSession: {session}\n\n{quote}"
     return msg
 
 
@@ -329,19 +380,23 @@ def format_news_alert(title: str, link: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are Jarvis, an elite AI trading assistant. Answer questions about ALL markets: "
-    "Gold (XAU/USD), Bitcoin (BTC/USD), Ethereum (ETH/USD), Solana (SOL/USD), USD/JPY.\n\n"
-    "Your trading method:\n"
-    "- CRT (Candle Range Theory): identify High/Low sweeps\n"
-    "- Malaysian S/R confluences for entries\n"
-    "- CISD (Change in State of Delivery) for confirmation\n"
-    "- Sessions: Asian 02-06 UTC = prime, London = caution/reduced size, NY 13-18 UTC = secondary\n\n"
-    "STRICT RULES - never break these:\n"
-    "1. ALWAYS answer the question asked. Asked about Solana? Answer Solana. Asked about BTC? Answer BTC.\n"
-    "2. TP MUST be AT LEAST 150 pips from entry. Never give TP less than 150 pips. Ever.\n"
-    "3. SL should be 40-60 pips max. Risk:Reward minimum 1:3.\n"
-    "4. Always state current session and if it is a good time to trade.\n"
-    "5. Be concise - max 6 lines. Give exact numbers for Entry, SL, TP."
+    "You are Jarvis — a sharp, confident AI trading assistant with real personality. "
+    "You speak like a knowledgeable older brother: direct, warm, occasionally witty, never robotic. "
+    "The user's names are: Scruz, Bigscruz, Deej, Scru, BigDawg, Boss, Scruman. Use one naturally each message — vary it, never repeat the same name twice in a row. "
+    "Mix up what you call him naturally. Sometimes his name, sometimes boss. Never forced, never all at once.\n\n"
+    "You cover ALL markets: Gold (XAU/USD), Bitcoin (BTC/USD), Ethereum (ETH/USD), Solana (SOL/USD), USD/JPY.\n\n"
+    "Trading method:\n"
+    "- CRT (Candle Range Theory): High/Low sweeps\n"
+    "- Malaysian S/R confluences\n"
+    "- CISD (Change in State of Delivery)\n"
+    "- Sessions: Asian 02-06 UTC = prime, London = caution, NY 13-18 UTC = secondary\n\n"
+    "STRICT RULES — never break:\n"
+    "1. Answer the question asked. Asked about SOL? Answer SOL. Asked about BTC? Answer BTC.\n"
+    "2. TP MUST be AT LEAST 150 pips from entry. Never less. Ever.\n"
+    "3. SL max 40-60 pips. Risk:Reward minimum 1:3.\n"
+    "4. Always mention session and whether to trade.\n"
+    "5. Max 6 lines. Exact numbers for Entry, SL, TP.\n"
+    "6. If it is dead zone or bad session, say so clearly but add a brief motivational line to keep the boss focused."
 )
 
 
@@ -796,11 +851,20 @@ def scanner_loop():
 
             # ── Session change notification ──────────────────────────────────
             if session != prev_session and prev_session is not None:
+                n = get_name()
+                asian_msgs = [
+                    f"🌏 ASIAN SESSION OPEN, {n}.\nThis is prime time. Watch for Sydney high sweeps on Gold.\nClean entries only — CRT + Malaysian S/R. Let's get it.",
+                    f"🌏 ASIAN SESSION LIVE, {n}.\nSydney set the highs. Now we watch for the sweep.\nGold is the focus. 150 pips minimum. Be patient.",
+                ]
+                ny_msgs = [
+                    f"🗽 NEW YORK SESSION OPEN, {n}.\nSecondary entries only — confirm the trend before you commit.\nDon't chase. Let the setup come to you.",
+                    f"🗽 NY SESSION IS LIVE, {n}.\nVolatility picks up here. Confirm CISD before entering.\nGold and crypto are on watch.",
+                ]
                 messages = {
-                    "ASIAN":    "🌏 ASIAN SESSION OPEN\nWatch for Sydney high sweeps. Gold focus. Clean entries.",
-                    "NEW_YORK": "🗽 NEW YORK SESSION OPEN\nSecondary entries. Confirm trend before entering.",
-                    "LONDON":   "🇬🇧 LONDON SESSION\n⚠️ Caution mode. Signals active but chop risk HIGH.\nReduce size. Manage existing trades carefully.",
-                    "DEAD":     "💤 Markets closing. Rest up, boss.",
+                    "ASIAN":    random.choice(asian_msgs),
+                    "NEW_YORK": random.choice(ny_msgs),
+                    "LONDON":   f"🇬🇧 LONDON SESSION, {n}.\n⚠️ Caution mode. Signals active but chop risk is HIGH.\nReduce size. Confirm twice. Manage existing trades carefully.",
+                    "DEAD":     f"💤 Markets closing, {n}. Rest up.\nAsian session opens 02:00 UTC — be ready.",
                 }
                 msg = messages.get(session)
                 if msg:
@@ -838,6 +902,12 @@ def scanner_loop():
                         msg = format_news_alert(article["title"], article["link"])
                         safe_send(msg)
                         sent_news_urls.add(article["link"])
+
+            # ── Random motivational drop every ~90 mins ──────────────────
+            if loop_count % 90 == 0 and loop_count > 0:
+                quote = random.choice(MOTIVATIONAL_QUOTES)
+                name = get_boss_name()
+                safe_send(f"🧠 Jarvis drop for {name}:\n\n{quote}")
 
             loop_count += 1
 
