@@ -6,6 +6,7 @@ import threading
 import requests
 import feedparser
 import anthropic
+import base64
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -30,7 +31,7 @@ ER_API_KEY        = os.environ["ER_API_KEY"]
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# ── Anthropic Client (optional fallback) ──────────────────────────────────────
+# ── Anthropic Client ──────────────────────────────────────────────────────────
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # ── Markets ───────────────────────────────────────────────────────────────────
@@ -58,7 +59,8 @@ def get_session(utc_hour: int) -> str:
         return "DEAD"
 
 def is_signal_allowed(session: str) -> bool:
-    return session in ("ASIAN", "NEW_YORK")
+    # Now includes LONDON (with warning tag)
+    return session in ("ASIAN", "NEW_YORK", "LONDON")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 price_history:  dict[str, list[float]] = {s: [] for s in SYMBOLS}
@@ -66,6 +68,7 @@ last_prices:    dict[str, float]       = {}
 sent_news_urls: set[str]               = set()
 last_signal_time: dict[str, float]     = {}
 last_signal_dir:  dict[str, str]       = {}
+greeted_periods:  set[str]             = set()
 
 SIGNAL_COOLDOWN_SECS = 1800
 MIN_SWEEP_PIPS = {
@@ -90,6 +93,72 @@ def safe_send(text: str):
         _bot_ref.send_message(chat_id=CHAT_ID, text=text),
         _event_loop,
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 1 — TIME-BASED GREETINGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_greeting_period(utc_hour: int) -> str:
+    """Return greeting period key based on UTC hour."""
+    if 5 <= utc_hour < 12:
+        return "morning"
+    elif 12 <= utc_hour < 17:
+        return "afternoon"
+    elif 17 <= utc_hour < 21:
+        return "evening"
+    else:
+        return "night"
+
+
+def build_greeting(utc_hour: int) -> str:
+    """Build a time-appropriate greeting with session tip."""
+    period = get_greeting_period(utc_hour)
+    session = get_session(utc_hour)
+
+    greetings = {
+        "morning": (
+            "🌅 Good morning, boss.\n"
+            "Asian session winding down. Review overnight sweeps on Gold.\n"
+            "London opens soon — stay cautious, let price settle.\n"
+            "Trading pattern: CRT + Malaysian S/R + CISD"
+        ),
+        "afternoon": (
+            "☀️ Good afternoon.\n"
+            "NY session is active. Secondary entries only — confirm the trend.\n"
+            "Watch for Gold and crypto setups. 150 pip minimum target.\n"
+            "Trading pattern: CRT + Malaysian S/R + CISD"
+        ),
+        "evening": (
+            "🌆 Good evening.\n"
+            "NY session closing. Manage open trades, don't open new ones.\n"
+            "Asian session sets up in a few hours — get some rest.\n"
+            "Trading pattern: CRT + Malaysian S/R + CISD"
+        ),
+        "night": (
+            "🌙 Good night, boss.\n"
+            "Dead zone — no trading. Let the market breathe.\n"
+            "Asian session opens 02:00 UTC. Sydney will set the highs to sweep.\n"
+            "Rest up. Sharp mind = sharp entries."
+        ),
+    }
+
+    msg = greetings.get(period, "Jarvis online.")
+    msg += f"\n\nCurrent session: {session}"
+    return msg
+
+
+def check_and_send_greeting():
+    """Send greeting once per period (morning/afternoon/evening/night)."""
+    utc_hour = datetime.now(timezone.utc).hour
+    period   = get_greeting_period(utc_hour)
+
+    if period not in greeted_periods:
+        greeted_periods.add(period)
+        # Clear old periods so next day works
+        if len(greeted_periods) > 4:
+            greeted_periods.clear()
+            greeted_periods.add(period)
+        safe_send(build_greeting(utc_hour))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING
@@ -152,6 +221,73 @@ def fetch_all_prices() -> dict[str, float | None]:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 2 — NEWS → PAIR ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Keyword → which pairs are affected + expected direction + pip estimate
+NEWS_PAIR_MAP = {
+    # Gold triggers
+    "gold":         [("XAU/USD", "BUY",  "100-200 pips — safe haven demand")],
+    "inflation":    [("XAU/USD", "BUY",  "80-150 pips — inflation hedge"), ("USD/JPY", "BUY", "30-60 pips")],
+    "fed":          [("XAU/USD", "SELL", "80-150 pips — rate hike pressure"), ("USD/JPY", "BUY", "40-80 pips")],
+    "fomc":         [("XAU/USD", "SELL", "100-200 pips — USD strength"), ("USD/JPY", "BUY", "50-100 pips")],
+    "interest rate":[("XAU/USD", "SELL", "100-200 pips"), ("USD/JPY", "BUY", "50-100 pips")],
+    "rate cut":     [("XAU/USD", "BUY",  "150-250 pips — dovish boost"), ("USD/JPY", "SELL", "50-80 pips")],
+    "war":          [("XAU/USD", "BUY",  "150-300 pips — geopolitical spike"), ("BTC/USD", "BUY", "500-1000 pips")],
+    "iran":         [("XAU/USD", "BUY",  "100-200 pips — geopolitical risk")],
+    "sanctions":    [("XAU/USD", "BUY",  "80-150 pips"), ("BTC/USD", "BUY", "300-600 pips — sanction bypass")],
+    "recession":    [("XAU/USD", "BUY",  "200-400 pips — risk-off"), ("BTC/USD", "SELL", "500-1000 pips")],
+    # Crypto triggers
+    "bitcoin":      [("BTC/USD", "BUY",  "200-500 pips — sentiment driven")],
+    "btc":          [("BTC/USD", "BUY",  "200-500 pips")],
+    "ethereum":     [("ETH/USD", "BUY",  "100-300 pips")],
+    "eth":          [("ETH/USD", "BUY",  "100-300 pips")],
+    "solana":       [("SOL/USD", "BUY",  "50-150 pips")],
+    "crypto":       [("BTC/USD", "BUY",  "200-500 pips"), ("ETH/USD", "BUY", "100-200 pips")],
+    "sec":          [("BTC/USD", "SELL", "300-600 pips — regulatory fear"), ("ETH/USD", "SELL", "150-300 pips")],
+    "etf":          [("BTC/USD", "BUY",  "300-800 pips — institutional inflow")],
+    # Forex triggers
+    "dollar":       [("USD/JPY", "BUY",  "30-80 pips — USD strength"), ("XAU/USD", "SELL", "50-100 pips")],
+    "yen":          [("USD/JPY", "SELL", "30-80 pips — yen safe haven")],
+    "boj":          [("USD/JPY", "SELL", "50-120 pips — BoJ intervention risk")],
+    "tariff":       [("XAU/USD", "BUY",  "80-150 pips — trade war hedge"), ("USD/JPY", "SELL", "30-60 pips")],
+    "trump":        [("XAU/USD", "BUY",  "100-200 pips — uncertainty premium"), ("BTC/USD", "BUY", "300-500 pips")],
+    "oil":          [("XAU/USD", "BUY",  "50-100 pips — inflation risk")],
+}
+
+
+def analyse_news_pairs(title: str) -> str:
+    """Given a news headline, return which pairs to watch and pip estimate."""
+    title_lower = title.lower()
+    hits = {}  # pair → list of analysis strings
+
+    for keyword, impacts in NEWS_PAIR_MAP.items():
+        if keyword in title_lower:
+            for pair, direction, estimate in impacts:
+                key = f"{pair}_{direction}"
+                if key not in hits:
+                    hits[key] = (pair, direction, estimate)
+
+    if not hits:
+        return ""
+
+    lines = ["📊 Pair Impact:"]
+    for pair, direction, estimate in hits.values():
+        arrow = "⬆️" if direction == "BUY" else "⬇️"
+        lines.append(f"  {arrow} {SYMBOLS.get(pair, pair)} ({pair}) — {direction} {estimate}")
+
+    return "\n".join(lines)
+
+
+def format_news_alert(title: str, link: str) -> str:
+    """Format a news alert with pair analysis appended."""
+    analysis = analyse_news_pairs(title)
+    msg = f"📰 NEWS\n\n{title}\n{link}"
+    if analysis:
+        msg += f"\n\n{analysis}"
+    return msg
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AI — Groq primary, Anthropic fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -160,7 +296,7 @@ SYSTEM_PROMPT = (
     "- CRT (Candle Range Theory) High/Low sweep strategy\n"
     "- Malaysian S/R confluences\n"
     "- Change in State of Delivery (CISD)\n"
-    "- Session trading: Asian sweeps (2-6am UTC), London quiet, NY entries\n"
+    "- Session trading: Asian sweeps (2-6am UTC), London caution, NY entries\n"
     "- Target: 150 pips minimum per trade on Gold\n\n"
     "Be concise and direct. Always give entry, SL, and TP.\n"
     "Always mention which session is active and whether it is a good time to trade."
@@ -168,7 +304,6 @@ SYSTEM_PROMPT = (
 
 
 def ask_groq(user_message: str, price_ctx: str) -> str:
-    """Primary AI — Groq (free, fast)."""
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -194,7 +329,6 @@ def ask_groq(user_message: str, price_ctx: str) -> str:
 
 
 def ask_anthropic(user_message: str, price_ctx: str) -> str:
-    """Fallback AI — Anthropic."""
     if not ai_client:
         raise Exception("No Anthropic key configured")
     resp = ai_client.messages.create(
@@ -214,14 +348,12 @@ def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
         lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in prices.items() if p]
         price_ctx += "Current prices:\n" + "\n".join(lines)
 
-    # Try Groq first
     if GROQ_API_KEY:
         try:
             return ask_groq(user_message, price_ctx)
         except Exception as e:
             log.warning(f"Groq failed, trying Anthropic: {e}")
 
-    # Fall back to Anthropic
     if ANTHROPIC_API_KEY:
         try:
             return ask_anthropic(user_message, price_ctx)
@@ -231,7 +363,64 @@ def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
     return "AI unavailable. Add GROQ_API_KEY to Railway variables (free at console.groq.com)"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DETECTION
+# FEATURE 4 — CHART IMAGE SCAN (Anthropic Vision)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHART_SCAN_PROMPT = (
+    "You are Jarvis, an elite trading analyst. Analyse this chart image using:\n"
+    "- CRT (Candle Range Theory): identify recent High/Low sweeps\n"
+    "- Malaysian S/R: key support and resistance zones\n"
+    "- CISD: Change in State of Delivery signals\n"
+    "- Session context: Asian sweeps → NY entries\n\n"
+    "Provide:\n"
+    "1. What pattern you see (sweep high, sweep low, consolidation, trend)\n"
+    "2. BUY or SELL bias with reason\n"
+    "3. Suggested Entry, SL, TP (in pips or price)\n"
+    "4. Confidence level (Low/Medium/High)\n\n"
+    "Be concise. Max 200 words."
+)
+
+
+async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """Send chart image to Anthropic Claude Vision for analysis."""
+    if not ai_client:
+        return (
+            "⚠️ Chart scan needs ANTHROPIC_API_KEY.\n"
+            "Add it to Railway variables and top up $5 at console.anthropic.com"
+        )
+
+    try:
+        image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+        resp = ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": image_data,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": CHART_SCAN_PROMPT,
+                        },
+                    ],
+                }
+            ],
+        )
+        return f"🔍 Chart Scan:\n\n{resp.content[0].text}"
+    except Exception as e:
+        log.error(f"Chart scan error: {e}")
+        return f"Chart scan failed: {e}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL DETECTION (updated — London now included with ⚠️ warning)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pip_size(symbol: str) -> float:
@@ -264,6 +453,9 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
     name      = SYMBOLS[symbol]
     min_sweep = MIN_SWEEP_PIPS.get(symbol, 10.0)
 
+    # London warning tag
+    london_warn = "\n⚠️ LONDON SESSION — High chop risk. Reduce size. Confirm twice." if session == "LONDON" else ""
+
     # HIGH SWEEP → SELL
     sweep_high = (curr_high - prev_high) / ps
     if curr_high > prev_high and price < prev_high and sweep_high >= min_sweep:
@@ -274,10 +466,11 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "SELL"
             return (
-                f"SELL SIGNAL  {name} [{session}]\n"
+                f"🔴 SELL SIGNAL — {name} [{session}]\n"
                 f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
                 f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"150 pips | CRT + Malaysian S/R"
+                f"Target: 150 pips | CRT + Malaysian S/R"
+                f"{london_warn}"
             )
 
     # LOW SWEEP → BUY
@@ -290,10 +483,11 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "BUY"
             return (
-                f"BUY SIGNAL  {name} [{session}]\n"
+                f"🟢 BUY SIGNAL — {name} [{session}]\n"
                 f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
                 f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"150 pips | CRT + Malaysian S/R"
+                f"Target: 150 pips | CRT + Malaysian S/R"
+                f"{london_warn}"
             )
 
     return None
@@ -305,10 +499,10 @@ def detect_spike(symbol: str, price: float) -> str | None:
         return None
     pct = abs(price - last) / last * 100
     if pct >= 1.0:
-        arrow = "UP" if price > last else "DOWN"
+        arrow = "⬆️ UP" if price > last else "⬇️ DOWN"
         return (
-            f"SPIKE {arrow}  {SYMBOLS[symbol]}\n"
-            f"{pct:.2f}% move  |  {last:.4f} to {price:.4f}"
+            f"⚡ SPIKE {arrow} — {SYMBOLS[symbol]}\n"
+            f"{pct:.2f}% move  |  {last:.4f} → {price:.4f}"
         )
     return None
 
@@ -354,32 +548,36 @@ def is_market_relevant(title: str) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     utc_hour = datetime.now(timezone.utc).hour
     session  = get_session(utc_hour)
-    await update.message.reply_text(
-        f"Jarvis online.\n"
-        f"Current session: {session}\n\n"
-        f"Signal zones:\n"
-        f"  ASIAN 02:00-06:00 UTC = ACTIVE\n"
-        f"  LONDON 07:00-13:00 UTC = QUIET\n"
-        f"  NEW YORK 13:00-18:00 UTC = ACTIVE\n\n"
-        f"/price   - current prices\n"
-        f"/status  - bot status\n"
-        f"/news    - market news\n"
-        f"/signal  - manual CRT scan\n"
-        f"/session - current session info\n"
-        f"Or ask me anything."
+    greeting = build_greeting(utc_hour)
+    menu = (
+        f"{greeting}\n\n"
+        f"{'─' * 22}\n"
+        f"🤖 JARVIS COMMANDS\n"
+        f"{'─' * 22}\n"
+        f"💲 /price — Live prices (Gold, BTC, ETH, SOL, JPY)\n"
+        f"📊 /signal — Manual CRT signal scan\n"
+        f"📰 /news — News + pair analysis\n"
+        f"🕐 /session — Session status\n"
+        f"📈 /status — Bot health check\n"
+        f"🧠 /chat <question> — Ask Jarvis anything\n"
+        f"📸 Send a chart image for auto-scan\n"
+        f"{'─' * 22}\n"
+        f"_Trading pattern: CRT + Malaysian S/R + CISD_\n"
+        f"_Asian session = prime. London = caution. NY = secondary._"
     )
+    await update.message.reply_text(menu)
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     utc_hour = datetime.now(timezone.utc).hour
     session  = get_session(utc_hour)
     advice = {
-        "ASIAN":     "ACTIVE - Asian session. Watch for Sydney high sweeps. Clean entries.",
-        "ASIAN_END": "TRANSITION - Asian ending. Be cautious.",
-        "LONDON":    "QUIET MODE - London chop. No new entries. Manage existing trades only.",
-        "NEW_YORK":  "ACTIVE - NY session. Secondary entries if trend confirms.",
-        "SYDNEY":    "WATCH ONLY - Sydney setting up highs for Asian sweep.",
-        "DEAD":      "DEAD ZONE - No trading. Rest.",
+        "ASIAN":     "✅ ACTIVE — Asian session. Watch for Sydney high sweeps. Gold focus. Clean entries.",
+        "ASIAN_END": "⚠️ TRANSITION — Asian ending. Be cautious.",
+        "LONDON":    "⚠️ CAUTION — London session. Signals active but chop risk is HIGH. Reduce position size. Confirm twice before entering.",
+        "NEW_YORK":  "✅ ACTIVE — NY session. Secondary entries if trend confirms.",
+        "SYDNEY":    "👀 WATCH ONLY — Sydney setting up highs for Asian sweep.",
+        "DEAD":      "💤 DEAD ZONE — No trading. Rest.",
     }
     await update.message.reply_text(
         f"Session: {session}\n"
@@ -390,10 +588,10 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prices = fetch_all_prices()
-    lines  = ["Current Prices:"]
+    lines  = ["💲 Current Prices:"]
     for sym, price in prices.items():
         val = f"{price:,.4f}" if price else "unavailable"
-        lines.append(f"  {SYMBOLS[sym]}: {val}")
+        lines.append(f"  {SYMBOLS[sym]} ({sym}): {val}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -402,14 +600,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session  = get_session(utc_hour)
     n        = sum(1 for p in last_prices.values() if p)
     depth    = len(price_history.get("XAU/USD", []))
-    ai_status = "Groq" if GROQ_API_KEY else ("Anthropic" if ANTHROPIC_API_KEY else "NONE")
+    ai_status = "Groq ✅" if GROQ_API_KEY else ("Anthropic ✅" if ANTHROPIC_API_KEY else "❌ NONE")
+    vision_status = "✅ Active" if ANTHROPIC_API_KEY else "⚠️ Add ANTHROPIC_API_KEY"
     await update.message.reply_text(
-        f"Jarvis Status\n"
+        f"📈 Jarvis Status\n"
         f"Session: {session}\n"
-        f"AI: {ai_status}\n"
-        f"Markets: {n}/{len(SYMBOLS)}\n"
+        f"AI Chat: {ai_status}\n"
+        f"Chart Vision: {vision_status}\n"
+        f"Markets live: {n}/{len(SYMBOLS)}\n"
         f"History: {depth} candles\n"
-        f"Status: RUNNING"
+        f"Status: 🟢 RUNNING"
     )
 
 
@@ -418,10 +618,9 @@ async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not articles:
         await update.message.reply_text("No new market news right now.")
         return
-    lines = ["Latest Market News:"]
     for a in articles:
-        lines.append(f"\n- {a['title']}")
-    await update.message.reply_text("\n".join(lines))
+        msg = format_news_alert(a["title"], a["link"])
+        await update.message.reply_text(msg)
 
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -432,7 +631,10 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Session: {session}\n"
             f"No signals during this session.\n"
-            f"Active windows: Asian 02:00-06:00 UTC or NY 13:00-18:00 UTC"
+            f"Active windows:\n"
+            f"  Asian 02:00-06:00 UTC\n"
+            f"  London 07:00-13:00 UTC (⚠️ with warning)\n"
+            f"  NY 13:00-18:00 UTC"
         )
         return
 
@@ -451,11 +653,55 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(sig)
     else:
         depth = len(price_history.get("XAU/USD", []))
+        london_note = "\n⚠️ London session — signals on but chop risk high." if session == "LONDON" else ""
         await update.message.reply_text(
             f"Session: {session}\n"
             f"No CRT setups right now.\n"
-            f"History: {depth}/20 candles."
+            f"History: {depth}/20 candles needed."
+            f"{london_note}"
         )
+
+
+async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Explicit /chat command."""
+    text = " ".join(ctx.args) if ctx.args else ""
+    if not text:
+        await update.message.reply_text("Usage: /chat <your question>")
+        return
+    prices = fetch_all_prices()
+    reply  = ask_jarvis(text, prices)
+    await update.message.reply_text(reply)
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Feature 4: Auto chart scan when user sends a photo."""
+    await update.message.reply_text("🔍 Scanning chart... one moment.")
+    try:
+        photo   = update.message.photo[-1]  # Highest resolution
+        file    = await ctx.bot.get_file(photo.file_id)
+        img_bytes = await file.download_as_bytearray()
+        result  = await scan_chart_image(bytes(img_bytes), "image/jpeg")
+        await update.message.reply_text(result)
+    except Exception as e:
+        log.error(f"Photo handler error: {e}")
+        await update.message.reply_text(f"Chart scan error: {e}")
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle file sends (uncompressed photos sent as documents)."""
+    doc = update.message.document
+    if not doc or not doc.mime_type or not doc.mime_type.startswith("image/"):
+        await handle_message(update, ctx)
+        return
+    await update.message.reply_text("🔍 Scanning chart (file)... one moment.")
+    try:
+        file      = await ctx.bot.get_file(doc.file_id)
+        img_bytes = await file.download_as_bytearray()
+        result    = await scan_chart_image(bytes(img_bytes), doc.mime_type)
+        await update.message.reply_text(result)
+    except Exception as e:
+        log.error(f"Document handler error: {e}")
+        await update.message.reply_text(f"Chart scan error: {e}")
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -483,7 +729,7 @@ def scanner_loop():
     while _event_loop is None:
         time.sleep(1)
 
-    loop_count = 0
+    loop_count   = 0
     prev_session = None
 
     while True:
@@ -494,13 +740,16 @@ def scanner_loop():
 
             log.info(f"[{now}] Session: {session}")
 
-            # Session change notification
+            # ── Feature 1: Greetings ─────────────────────────────────────────
+            check_and_send_greeting()
+
+            # ── Session change notification ──────────────────────────────────
             if session != prev_session and prev_session is not None:
                 messages = {
-                    "ASIAN":    "ASIAN SESSION OPEN\nWatch for Sydney high sweeps. Gold focus. Clean entries.",
-                    "NEW_YORK": "NEW YORK SESSION OPEN\nSecondary entries. Confirm trend before entering.",
-                    "LONDON":   "LONDON SESSION\nQuiet mode ON. No new signals. Manage existing trades only.",
-                    "DEAD":     "Markets closing. Rest up.",
+                    "ASIAN":    "🌏 ASIAN SESSION OPEN\nWatch for Sydney high sweeps. Gold focus. Clean entries.",
+                    "NEW_YORK": "🗽 NEW YORK SESSION OPEN\nSecondary entries. Confirm trend before entering.",
+                    "LONDON":   "🇬🇧 LONDON SESSION\n⚠️ Caution mode. Signals active but chop risk HIGH.\nReduce size. Manage existing trades carefully.",
+                    "DEAD":     "💤 Markets closing. Rest up, boss.",
                 }
                 msg = messages.get(session)
                 if msg:
@@ -530,11 +779,13 @@ def scanner_loop():
 
                 last_prices[sym] = price
 
+            # ── Feature 2: News with pair analysis ──────────────────────────
             if loop_count % 10 == 0:
                 articles = fetch_news(3)
                 for article in articles:
                     if is_market_relevant(article["title"]):
-                        safe_send(f"NEWS\n\n{article['title']}\n{article['link']}")
+                        msg = format_news_alert(article["title"], article["link"])
+                        safe_send(msg)
                         sent_news_urls.add(article["link"])
 
             loop_count += 1
@@ -556,12 +807,20 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     _bot_ref = app.bot
 
+    # Commands
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("price",   cmd_price))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("news",    cmd_news))
     app.add_handler(CommandHandler("signal",  cmd_signal))
     app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("chat",    cmd_chat))
+
+    # Feature 4: Chart image scan — photos + file sends
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Text fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
