@@ -2,4 +2,4 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python Main.py"
+startCommand = "python3 Main.py"
