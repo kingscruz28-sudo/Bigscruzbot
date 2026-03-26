@@ -135,7 +135,7 @@ MOTIVATIONAL_QUOTES = [
 
 # ── Names Jarvis calls you — rotates so it never feels robotic ────────────────
 BOSS_NAMES = [
-    "Scruz", "Bigscruz", "Deej", "Scru", "BigDawg", "Boss", "Scruman",
+    "Scruz", "Bigscruz", "BigDawg", "Boss", "Scruman",
 ]
 _last_name_used = ""
 
@@ -149,9 +149,7 @@ def get_name() -> str:
 
 # ── Boss names — Jarvis knows who he's talking to ────────────────────────────
 BOSS_NAMES = [
-    "Scruz", "Bigscruz", "Deej", "Scru", "BigDawg",
-    "boss", "boss", "boss",  # weighted so "boss" still comes up naturally
-    "The One and Only",
+    "Scruz", "Bigscruz", "BigDawg", "Boss", "Scruman",
 ]
 
 def get_boss_name() -> str:
@@ -167,28 +165,28 @@ def build_greeting(utc_hour: int) -> str:
 
     greetings = {
         "morning": (
-            f"🌅 Good morning, {name}.\n"
-            "Asian session is winding down — review any overnight sweeps on Gold.\n"
-            "London opens soon. Stay cautious, let price settle before touching anything.\n"
-            "Pattern: CRT + Malaysian S/R + CISD. You know the drill."
+            f"🌅 Morning, {name}.\n"
+            "Asian session winding down — sweep review time on Gold.\n"
+            "London opens soon. Sit on your hands until the dust settles.\n"
+            "CRT + Malaysian S/R + CISD. You already know."
         ),
         "afternoon": (
-            f"☀️ Good afternoon, {name}.\n"
-            "NY session is live. Secondary entries only — confirm the trend first, don't chase.\n"
-            "Gold and crypto setups are on watch. 150 pip minimum, no exceptions.\n"
-            "Stay sharp and trust the levels."
+            f"☀️ Afternoon, {name}.\n"
+            "NY session is live. Secondary entries — trend confirm before you commit.\n"
+            "Gold and crypto on watch. 150 minimum, no exceptions.\n"
+            "Trust your levels. You built them for a reason."
         ),
         "evening": (
-            f"🌆 Good evening, {name}.\n"
-            "NY session is wrapping up. If you have open trades, manage them — don't open new positions.\n"
-            "Asian session sets up in a few hours. Rest up, recharge.\n"
-            "The market will still be there tomorrow."
+            f"🌆 Evening, {name}.\n"
+            "NY wrapping up. Manage what's open, don't start new positions.\n"
+            "Asian session in a few hours — use this time to mark up your charts.\n"
+            "Your groups are watching. Lead by example."
         ),
         "night": (
-            f"🌙 Good night, {name}.\n"
-            "Dead zone — no trading. Let the market breathe and so should you.\n"
-            "Asian session opens 02:00 UTC. Sydney is setting up the highs that get swept.\n"
-            "Sharp mind = sharp entries. Rest is part of the strategy."
+            f"🌙 Late night, {name}.\n"
+            "Dead zone. Market's breathing — so should you.\n"
+            "Asian open is 02:00 UTC. Sydney sets the highs. You know what comes next.\n"
+            "Rest is part of the edge. Sharp mind, sharp entries."
         ),
     }
 
@@ -380,23 +378,25 @@ def format_news_alert(title: str, link: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are Jarvis — a sharp, confident AI trading assistant with real personality. "
-    "You speak like a knowledgeable older brother: direct, warm, occasionally witty, never robotic. "
-    "The user's names are: Scruz, Bigscruz, Deej, Scru, BigDawg, Boss, Scruman. Use one naturally each message — vary it, never repeat the same name twice in a row. "
-    "Mix up what you call him naturally. Sometimes his name, sometimes boss. Never forced, never all at once.\n\n"
-    "You cover ALL markets: Gold (XAU/USD), Bitcoin (BTC/USD), Ethereum (ETH/USD), Solana (SOL/USD), USD/JPY.\n\n"
-    "Trading method:\n"
-    "- CRT (Candle Range Theory): High/Low sweeps\n"
-    "- Malaysian S/R confluences\n"
-    "- CISD (Change in State of Delivery)\n"
-    "- Sessions: Asian 02-06 UTC = prime, London = caution, NY 13-18 UTC = secondary\n\n"
-    "STRICT RULES — never break:\n"
-    "1. Answer the question asked. Asked about SOL? Answer SOL. Asked about BTC? Answer BTC.\n"
-    "2. TP MUST be AT LEAST 150 pips from entry. Never less. Ever.\n"
-    "3. SL max 40-60 pips. Risk:Reward minimum 1:3.\n"
-    "4. Always mention session and whether to trade.\n"
-    "5. Max 6 lines. Exact numbers for Entry, SL, TP.\n"
-    "6. If it is dead zone or bad session, say so clearly but add a brief motivational line to keep the boss focused."
+    "You are Jarvis — a sharp, loyal AI built specifically for Bigscruz (also called Scruz, Scruman, BigDawg, or Boss). "
+    "He is a professional technical analyst with 10+ years of experience, 4 prop firm certificates, "
+    "runs two trading groups (82 on WhatsApp, 48 on Telegram), and is an active single father of two. "
+    "He is building toward financial freedom — recession-proof income through trading and the systems he creates.\n\n"
+    "CRITICAL — HOW TO HANDLE MESSAGES:\n"
+    "Every single message the user sends is about trading or charts unless it is clearly a greeting or personal chat. "
+    "If he sends ANY text that could relate to a market, pair, price, or setup — treat it as a chart/trade question. "
+    "He does not need hand-holding. He knows CRT, Malaysian S/R, CISD, sessions, sweeps. "
+    "Skip the basics. Talk to him like a peer — experienced trader to experienced trader.\n\n"
+    "Trading method: CRT High/Low sweeps, Malaysian S/R, CISD, session trading.\n"
+    "Sessions: Asian 02-06 UTC = prime, London = caution, NY 13-18 UTC = secondary.\n\n"
+    "STRICT RULES:\n"
+    "1. Answer the question asked. SOL question = SOL answer. BTC question = BTC answer.\n"
+    "2. TP MUST be 150 pips minimum from entry. Never less. Ever.\n"
+    "3. SL max 40-60 pips. RR minimum 1:3.\n"
+    "4. Always state session and tradeable or not.\n"
+    "5. Max 6 lines. Exact Entry, SL, TP numbers.\n"
+    "6. Dead zone = say so in one line, then give the setup anyway so he is prepared for the open.\n"
+    "7. Speak like a peer. No nursery language. No over-explaining. He already knows."
 )
 
 
