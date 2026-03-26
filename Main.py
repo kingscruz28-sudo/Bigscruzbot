@@ -242,8 +242,8 @@ def fetch_gold_price() -> float | None:
                 timeout=10,
             )
             price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-            # Sanity check — Gold is between 1500 and 4000 as of 2024-2025
-            if 1500 < price < 4000:
+            # Sanity check — Gold is between 2000 and 5000 as of 2025-2026
+            if 2000 < price < 5000:
                 log.info(f"Gold price from Yahoo ({ticker}): {price}")
                 return price
             else:
@@ -259,22 +259,22 @@ def fetch_gold_price() -> float | None:
         )
         data = r.json()
         price = float(data["rates"]["USD"])
-        if 1500 < price < 4000:
+        if 2000 < price < 5000:
             log.info(f"Gold price from frankfurter: {price}")
             return price
     except Exception as e:
         log.warning(f"Frankfurter gold error: {e}")
 
-    # Last resort: metals-live free API
+    # Last resort: fxratesapi (free, no SSL issues)
     try:
         r = requests.get(
-            "https://api.metals.live/v1/spot/gold",
+            "https://api.fxratesapi.com/latest?base=XAU&currencies=USD",
             timeout=10,
         )
         data = r.json()
-        price = float(data[0]["price"])
-        if 1500 < price < 4000:
-            log.info(f"Gold price from metals.live: {price}")
+        price = float(data["rates"]["USD"])
+        if 2000 < price < 5000:
+            log.info(f"Gold price from fxratesapi: {price}")
             return price
     except Exception as e:
         log.error(f"All gold sources failed. Last error: {e}")
