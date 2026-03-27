@@ -521,10 +521,30 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pip_size(symbol: str) -> float:
-    if "JPY" in symbol:       return 0.01
-    if symbol == "XAU/USD":   return 0.10
-    if symbol in ("ETH/USD", "SOL/USD", "BTC/USD"): return 1.0
+    # 1 pip = the minimum meaningful price movement for risk calculation
+    if "JPY" in symbol:              return 0.01    # 1 pip = 0.01
+    if symbol == "XAU/USD":          return 1.0     # Gold: 1 pip = $1.00
+    if symbol == "ETH/USD":          return 1.0     # ETH: 1 pip = $1.00
+    if symbol == "SOL/USD":          return 0.10    # SOL: 1 pip = $0.10
+    if symbol == "BTC/USD":          return 10.0    # BTC: 1 pip = $10.00
     return 0.0001
+
+
+# SL and TP distances in pips per symbol
+SL_PIPS = {
+    "XAU/USD": 50,    # $50 above/below sweep
+    "ETH/USD": 50,    # $50 above/below sweep
+    "USD/JPY": 50,    # 50 pips
+    "SOL/USD": 30,    # $3 above/below sweep
+    "BTC/USD": 50,    # $500 above/below sweep
+}
+TP_PIPS = {
+    "XAU/USD": 150,   # $150 target
+    "ETH/USD": 150,   # $150 target
+    "USD/JPY": 150,   # 150 pips
+    "SOL/USD": 150,   # $15 target
+    "BTC/USD": 150,   # $1500 target
+}
 
 
 def cooldown_ok(symbol: str) -> bool:
@@ -549,6 +569,8 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
     ps        = pip_size(symbol)
     name      = SYMBOLS[symbol]
     min_sweep = MIN_SWEEP_PIPS.get(symbol, 10.0)
+    sl_dist   = SL_PIPS.get(symbol, 50) * ps
+    tp_dist   = TP_PIPS.get(symbol, 150) * ps
 
     # London warning tag
     london_warn = "\n⚠️ LONDON SESSION — High chop risk. Reduce size. Confirm twice." if session == "LONDON" else ""
@@ -558,8 +580,8 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
     if curr_high > prev_high and price < prev_high and sweep_high >= min_sweep:
         if cooldown_ok(symbol):
             entry = price
-            sl    = curr_high + (50 * ps)
-            tp    = entry - (150 * ps)
+            sl    = curr_high + sl_dist
+            tp    = entry - tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "SELL"
             return (
@@ -575,8 +597,8 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
     if curr_low < prev_low and price > prev_low and sweep_low >= min_sweep:
         if cooldown_ok(symbol):
             entry = price
-            sl    = curr_low - (50 * ps)
-            tp    = entry + (150 * ps)
+            sl    = curr_low - sl_dist
+            tp    = entry + tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "BUY"
             return (
