@@ -656,11 +656,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📰 /news — News + pair analysis\n"
         f"🕐 /session — Session status\n"
         f"📈 /status — Bot health check\n"
-        f"🧠 /chat <question> — Ask Jarvis anything\n"
+        f"🧠 /chat — Ask Jarvis anything\n"
         f"📸 Send a chart image for auto-scan\n"
         f"{'─' * 22}\n"
-        f"_Trading pattern: CRT + Malaysian S/R + CISD_\n"
-        f"_Asian session = prime. London = caution. NY = secondary._"
+        f"Trading pattern: CRT + Malaysian S/R + CISD\n"
+        f"Asian = prime. London = caution. NY = secondary."
     )
     await update.message.reply_text(menu)
 
