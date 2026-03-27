@@ -810,7 +810,33 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Chart scan error: {e}")
 
 
+# Responses when Scruz says thanks
+THANKS_RESPONSES = [
+    f"That's what I'm here for, {'{name}'}. Stay focused, the next setup is coming.",
+    f"All you, {'{name}'}. I just read the levels — you pulled the trigger.",
+    f"Let's go, {'{name}'}. Lock in the profit and reset. Next session, same energy.",
+    f"Don't thank me yet, {'{name}'} — thank me when we hit TP. 😤",
+    f"That's the system working, {'{name}'}. CRT doesn't lie.",
+    f"Built different, {'{name}'}. Now protect that capital and do it again.",
+    f"Anytime, {'{name}'}. That's what Jarvis is for. Eyes on the next sweep.",
+]
+
+THANKS_KEYWORDS = [
+    "thanks", "thank you", "cheers", "appreciate", "good job", "well done",
+    "nice one", "respect", "salute", "fire", "legendary", "goat", "mad ting",
+    "you're the man", "ur the man", "big up", "wagwan", "blessed"
+]
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower().strip()
+
+    # Check if it's a thank you / appreciation message
+    if any(kw in text for kw in THANKS_KEYWORDS) and len(text) < 60:
+        name = get_name()
+        response = random.choice(THANKS_RESPONSES).replace("{name}", name)
+        await update.message.reply_text(response)
+        return
+
     prices = fetch_all_prices()
     reply  = ask_jarvis(update.message.text, prices)
     await update.message.reply_text(reply)
