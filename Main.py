@@ -1026,6 +1026,39 @@ async def cmd_poly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_week2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/week2 — Full Week 2 system status."""
+    try:
+        r      = requests.get(f"{WEEK2_BOT_URL}/state", timeout=5)
+        data   = r.json()
+        poly   = data.get("polymarket", {})
+        sol    = data.get("solana", {})
+        prices = data.get("prices", {})
+        auto_p = "🟢 AUTO" if data.get("auto_trade_poly") else "⚪ SIGNAL"
+        auto_s = "🟢 AUTO" if data.get("auto_trade_sol")  else "⚪ SIGNAL"
+        wins   = poly.get("wins", 0)
+        total  = poly.get("total_bets", 0)
+        wr     = f"{(wins/total*100):.1f}%" if total > 0 else "--"
+        await update.message.reply_text(
+            f"⚡ *JARVIS WEEK 2 STATUS*\n\n"
+            f"*POLYMARKET*\n"
+            f"Signal: {poly.get('last_signal','--')} @ {poly.get('last_confidence',0)}%\n"
+            f"Bets: {total} | WR: {wr} | PNL: ${poly.get('pnl_usdc',0):.2f}\n"
+            f"Mode: {auto_p}\n\n"
+            f"*SOLANA*\n"
+            f"Signals: {len(sol.get('signals',[]))} | PNL: ${sol.get('pnl_usd',0):.2f}\n"
+            f"Mode: {auto_s}\n\n"
+            f"*PRICES*\n"
+            f"BTC: ${prices.get('BTC',{}).get('price',0):,.0f}\n"
+            f"SOL: ${prices.get('SOL',{}).get('price',0):.2f}\n"
+            f"WIF: ${prices.get('WIF',{}).get('price',0):.4f}\n\n"
+            f"📊 localhost:5002/dashboard",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text("⚠️ Week 2 bot offline. Run run_week2.bat on your laptop.")
+
+
 async def cmd_sol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/sol — Solana status | /sol signals — latest signals"""
     args = ctx.args
@@ -1085,6 +1118,7 @@ def main():
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("poly",      cmd_poly))
     app.add_handler(CommandHandler("sol",       cmd_sol))
+    app.add_handler(CommandHandler("week2",     cmd_week2))
 
     # Feature 4: Chart image scan — photos + file sends
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1186,9 +1220,6 @@ async def cmd_autotrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Use /autotrade on or /autotrade off\n"
             f"Risk: {RISK_PERCENT}% per trade | Max lot: {MAX_LOT}"
         )
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
