@@ -32,6 +32,9 @@ ER_API_KEY        = os.environ["ER_API_KEY"]
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── Week 2 — Polymarket + Solana bot URL ─────────────────────────────────────
+WEEK2_BOT_URL = os.environ.get("WEEK2_BOT_URL", "http://localhost:5002")
+
 # ── MT5 Auto-Trading Settings (optional — Railway vars) ───────────────────────
 MT5_LOGIN      = int(os.environ.get("MT5_LOGIN", 0))
 MT5_PASSWORD   = os.environ.get("MT5_PASSWORD", "")
@@ -984,6 +987,82 @@ def scanner_loop():
         time.sleep(60)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# WEEK 2 — POLYMARKET + SOLANA COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_poly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/poly — Polymarket status | /poly stats — last 5 positions"""
+    args = ctx.args
+    sub  = args[0].lower() if args else "status"
+    try:
+        r    = requests.get(f"{WEEK2_BOT_URL}/state", timeout=5)
+        poly = r.json().get("polymarket", {})
+    except Exception:
+        await update.message.reply_text("⚠️ Week 2 bot offline.\nStart polymarket_solana_bot.py on your laptop first.")
+        return
+
+    if sub == "stats":
+        positions = poly.get("positions", [])[-5:]
+        if not positions:
+            await update.message.reply_text("⬡ No Polymarket positions yet.")
+            return
+        lines = ["⬡ *LAST 5 POLYMARKET POSITIONS*\n"]
+        for p in reversed(positions):
+            emoji = "📈" if p.get("direction") == "UP" else "📉"
+            lines.append(f"{emoji} {p.get('time')} | {p.get('direction')} | {p.get('confidence')}% | ${p.get('stake')} | {p.get('status')}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        wins  = poly.get("wins", 0)
+        total = poly.get("total_bets", 0)
+        wr    = f"{(wins/total*100):.1f}%" if total > 0 else "--"
+        await update.message.reply_text(
+            f"⬡ *JARVIS POLYMARKET STATUS*\n\n"
+            f"Last Signal: *{poly.get('last_signal','NONE')}* ({poly.get('last_confidence',0)}% conf)\n"
+            f"Total Bets: {total} | Wins: {wins} | Losses: {poly.get('losses',0)}\n"
+            f"Win Rate: *{wr}*\n"
+            f"PNL: *${poly.get('pnl_usdc',0):.2f} USDC*\n\n"
+            f"📊 Dashboard: localhost:5002/dashboard",
+            parse_mode="Markdown"
+        )
+
+
+async def cmd_sol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/sol — Solana status | /sol signals — latest signals"""
+    args = ctx.args
+    sub  = args[0].lower() if args else "status"
+    try:
+        data   = requests.get(f"{WEEK2_BOT_URL}/state", timeout=5).json()
+        sol    = data.get("solana", {})
+        prices = data.get("prices", {})
+    except Exception:
+        await update.message.reply_text("⚠️ Week 2 bot offline.\nStart polymarket_solana_bot.py on your laptop first.")
+        return
+
+    if sub == "signals":
+        signals = sol.get("signals", [])[-5:]
+        if not signals:
+            await update.message.reply_text("◎ No Solana signals yet — scanner is running.")
+            return
+        lines = ["◎ *LATEST SOL SIGNALS*\n"]
+        for s in reversed(signals):
+            emoji = "🚀" if s.get("action") == "BUY" else "🔴"
+            lines.append(f"{emoji} {s.get('symbol')} | {s.get('action')} | {s.get('reason')} | {s.get('time')}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        wallet = sol.get("address", "--")
+        await update.message.reply_text(
+            f"◎ *JARVIS SOLANA STATUS*\n\n"
+            f"Wallet: `{wallet[:12]}...`\n"
+            f"PNL: *${sol.get('pnl_usd',0):.2f}*\n"
+            f"Active Signals: {len(sol.get('signals',[]))}\n\n"
+            f"BTC: ${prices.get('BTC',{}).get('price',0):,.0f}\n"
+            f"SOL: ${prices.get('SOL',{}).get('price',0):.2f}\n\n"
+            f"📊 Dashboard: localhost:5002/dashboard",
+            parse_mode="Markdown"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1004,6 +1083,8 @@ def main():
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("chat",    cmd_chat))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
+    app.add_handler(CommandHandler("poly",      cmd_poly))
+    app.add_handler(CommandHandler("sol",       cmd_sol))
 
     # Feature 4: Chart image scan — photos + file sends
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1105,6 +1186,9 @@ async def cmd_autotrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Use /autotrade on or /autotrade off\n"
             f"Risk: {RISK_PERCENT}% per trade | Max lot: {MAX_LOT}"
         )
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
