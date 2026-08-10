@@ -168,11 +168,6 @@ def get_name() -> str:
     _last_name_used = name
     return name
 
-# ── Boss names — Jarvis knows who he's talking to ────────────────────────────
-BOSS_NAMES = [
-    "Scruz", "Bigscruz", "BigDawg", "Boss", "Scruman",
-]
-
 def get_boss_name() -> str:
     return random.choice(BOSS_NAMES)
 
