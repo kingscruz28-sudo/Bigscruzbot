@@ -87,24 +87,20 @@ class TestFetchGoldPrice:
         assert fetch_gold_price() == 2715.0
         assert len(getter.urls) == 2
 
-    def test_gld_ticker_can_never_satisfy_the_sanity_check(self, fake_get):
-        """Characterisation test, not an endorsement.
-
-        GLD is a gold ETF trading in the low hundreds, so its price can never
-        land inside the 2000-5000 band. The third Yahoo attempt is therefore
-        dead weight and always falls through to frankfurter.
-        """
+    def test_does_not_query_the_gld_etf(self, fake_get):
+        """Regression: GLD is a gold ETF trading in the low hundreds, so it
+        could never clear the 2000-5000 band. Querying it was always a wasted
+        request before the real fallbacks."""
         getter = fake_get(
             {
                 "GC%3DF": ConnectionError("down"),
                 "XAUUSD%3DX": ConnectionError("down"),
-                "GLD": yahoo(320.0),
                 "frankfurter": rates(2725.0),
             }
         )
 
         assert fetch_gold_price() == 2725.0
-        assert any("GLD" in u for u in getter.urls)
+        assert not any("GLD" in u for u in getter.urls)
 
     def test_falls_back_to_frankfurter_when_all_yahoo_tickers_fail(self, fake_get):
         fake_get(

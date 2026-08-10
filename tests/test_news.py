@@ -35,25 +35,50 @@ class TestAnalyseNewsPairs:
         assert "⬆️" in buy
         assert "⬇️" in sell
 
-    def test_conflicting_keywords_produce_contradictory_guidance(self):
-        """Characterisation test for existing behaviour, not an endorsement.
-
-        "fed" maps XAU/USD to SELL and "rate cut" maps it to BUY, and the hit
-        map is keyed by pair+direction, so one headline emits both.
-        """
+    def test_conflicting_keywords_are_flagged_not_both_called(self):
+        """Regression: "fed" maps gold SELL and "rate cut" maps it BUY, so the
+        headline used to emit both directions for the same pair."""
         result = analyse_news_pairs("Fed signals rate cut")
         gold_lines = [ln for ln in result.splitlines() if "XAU/USD" in ln]
-        assert len(gold_lines) == 2
-        assert any("BUY" in ln for ln in gold_lines)
-        assert any("SELL" in ln for ln in gold_lines)
 
-    def test_keywords_match_inside_unrelated_words(self):
-        """Characterisation test for a known false positive.
+        assert len(gold_lines) == 1
+        assert "MIXED" in gold_lines[0]
+        assert not any("BUY" in ln or "SELL" in ln for ln in gold_lines)
 
-        Matching is a plain substring check, so "whether" contains "eth" and
-        trips the Ethereum rule. Word-boundary matching would fix this.
-        """
-        assert "ETH/USD" in analyse_news_pairs("Whether the rally holds")
+    def test_non_conflicting_pairs_survive_alongside_a_conflict(self):
+        # "fed" gives gold SELL and "war" gives gold BUY, so gold is mixed —
+        # but USD/JPY and BTC/USD each get one direction and should still call.
+        result = analyse_news_pairs("Fed holds as war escalates")
+
+        gold = next(ln for ln in result.splitlines() if "XAU/USD" in ln)
+        assert "MIXED" in gold
+
+        assert "⬆️ USD/JPY" in result
+        assert "⬆️ Bitcoin" in result
+
+    @pytest.mark.parametrize(
+        "headline",
+        [
+            "Whether the rally holds",  # "whether" contains "eth"
+            "Award ceremony tonight",  # "award" contains "war"
+            "Second quarter results",  # "second" contains "sec"
+            "Forward guidance shifts",  # "forward" contains "war"
+        ],
+    )
+    def test_keywords_no_longer_match_inside_unrelated_words(self, headline):
+        assert analyse_news_pairs(headline) == ""
+
+    @pytest.mark.parametrize(
+        "headline,pair",
+        [
+            ("ETH breaks resistance", "ETH/USD"),
+            ("SEC announces crackdown", "BTC/USD"),
+            ("War breaks out", "XAU/USD"),
+            ("Oil spikes on supply fears", "XAU/USD"),
+        ],
+    )
+    def test_standalone_keywords_still_match(self, headline, pair):
+        assert pair in analyse_news_pairs(headline)
 
 
 class TestFormatNewsAlert:
@@ -88,9 +113,16 @@ class TestIsMarketRelevant:
     def test_rejects_unrelated_headline(self):
         assert is_market_relevant("Cat rescued from tree") is False
 
-    def test_substring_matching_causes_false_positives(self):
-        """Characterisation test: "award" contains "war"."""
-        assert is_market_relevant("Award ceremony tonight") is True
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Award ceremony tonight",  # contains "war"
+            "Second quarter earnings",  # contains "sec"
+            "Whether the rally holds",  # contains "eth"
+        ],
+    )
+    def test_no_longer_matches_inside_unrelated_words(self, title):
+        assert is_market_relevant(title) is False
 
 
 class TestFetchNews:

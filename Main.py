@@ -8,6 +8,7 @@ import feedparser
 import anthropic
 import base64
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from telegram import Update
@@ -256,7 +257,10 @@ def fetch_crypto_prices() -> dict[str, float | None]:
 
 def fetch_gold_price() -> float | None:
     # Try Yahoo Finance v8 first (GC=F = Gold futures)
-    for ticker in ["GC%3DF", "XAUUSD%3DX", "GLD"]:
+    # GLD is deliberately absent: it is a gold ETF trading in the low
+    # hundreds, so it could never clear the 2000-5000 sanity check below —
+    # querying it only ever cost a wasted request before the real fallbacks.
+    for ticker in ["GC%3DF", "XAUUSD%3DX"]:
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -365,13 +369,23 @@ NEWS_PAIR_MAP = {
 }
 
 
+def mentions_keyword(keyword: str, text: str) -> bool:
+    """Whole-word keyword match against lowercased text.
+
+    A plain substring test fired inside unrelated words — "whether" contains
+    "eth" and tripped the Ethereum rule, "award" contains "war" and tripped
+    the geopolitical one.
+    """
+    return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text) is not None
+
+
 def analyse_news_pairs(title: str) -> str:
     """Given a news headline, return which pairs to watch and pip estimate."""
     title_lower = title.lower()
-    hits = {}  # pair → list of analysis strings
+    hits = {}  # pair+direction → (pair, direction, estimate)
 
     for keyword, impacts in NEWS_PAIR_MAP.items():
-        if keyword in title_lower:
+        if mentions_keyword(keyword, title_lower):
             for pair, direction, estimate in impacts:
                 key = f"{pair}_{direction}"
                 if key not in hits:
@@ -380,10 +394,25 @@ def analyse_news_pairs(title: str) -> str:
     if not hits:
         return ""
 
+    # One headline can match keywords that disagree — "Fed signals rate cut"
+    # maps gold to SELL via "fed" and BUY via "rate cut". Calling both is
+    # worse than calling neither, so flag the pair as mixed instead.
+    directions: dict[str, set[str]] = {}
+    for pair, direction, _ in hits.values():
+        directions.setdefault(pair, set()).add(direction)
+    conflicted = {pair for pair, dirs in directions.items() if len(dirs) > 1}
+
     lines = ["📊 Pair Impact:"]
     for pair, direction, estimate in hits.values():
+        if pair in conflicted:
+            continue
         arrow = "⬆️" if direction == "BUY" else "⬇️"
         lines.append(f"  {arrow} {SYMBOLS.get(pair, pair)} ({pair}) — {direction} {estimate}")
+
+    for pair in sorted(conflicted):
+        lines.append(
+            f"  ⚠️ {SYMBOLS.get(pair, pair)} ({pair}) — MIXED signals, sit this one out"
+        )
 
     return "\n".join(lines)
 
@@ -766,7 +795,8 @@ def fetch_news(limit: int = 5) -> list[dict]:
 
 
 def is_market_relevant(title: str) -> bool:
-    return any(kw in title.lower() for kw in MARKET_KEYWORDS)
+    title_lower = title.lower()
+    return any(mentions_keyword(kw, title_lower) for kw in MARKET_KEYWORDS)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
@@ -814,7 +844,7 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    prices = fetch_all_prices()
+    prices = await asyncio.to_thread(fetch_all_prices)
     lines  = ["💲 Current Prices:"]
     for sym, price in prices.items():
         val = f"{price:,.4f}" if price else "unavailable"
@@ -865,7 +895,7 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    prices = fetch_all_prices()
+    prices = await asyncio.to_thread(fetch_all_prices)
     found  = []
     for sym, price in prices.items():
         if price is None:
@@ -894,7 +924,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args) if ctx.args else ""
     if not text:
         # No question given — return a quick market briefing
-        prices   = fetch_all_prices()
+        prices   = await asyncio.to_thread(fetch_all_prices)
         utc_hour = datetime.now(timezone.utc).hour
         session  = get_session(utc_hour)
         reply    = await asyncio.to_thread(
@@ -905,7 +935,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(reply)
         return
-    prices = fetch_all_prices()
+    prices = await asyncio.to_thread(fetch_all_prices)
     reply  = await asyncio.to_thread(ask_jarvis, text, prices)
     await update.message.reply_text(reply)
 
@@ -968,7 +998,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response)
         return
 
-    prices = fetch_all_prices()
+    prices = await asyncio.to_thread(fetch_all_prices)
     reply  = await asyncio.to_thread(ask_jarvis, update.message.text, prices)
     await update.message.reply_text(reply)
 
