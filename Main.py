@@ -501,6 +501,48 @@ CHART_SCAN_PROMPT = (
 )
 
 
+# Vision model for chart scans. Opus 5 reads charts far better than Haiku;
+# override via Railway if you want to trade accuracy for cost.
+CHART_SCAN_MODEL = os.environ.get("CHART_SCAN_MODEL", "claude-opus-5")
+
+
+def _request_chart_scan(image_data: str, mime_type: str):
+    """Blocking Anthropic call.
+
+    Kept separate so scan_chart_image can run it on a worker thread — the SDK
+    client is synchronous, and this model thinks before answering, so calling
+    it inline would stall every other Telegram update for the duration.
+    """
+    return ai_client.beta.messages.create(
+        model=CHART_SCAN_MODEL,
+        # Thinking is on by default on Opus 5 and shares this budget with the
+        # reply, so leave room for both.
+        max_tokens=4000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": CHART_SCAN_PROMPT,
+                    },
+                ],
+            }
+        ],
+    )
+
+
 async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """Send chart image to Anthropic Claude Vision for analysis."""
     if not ai_client:
@@ -511,30 +553,19 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 
     try:
         image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
-        resp = ai_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": CHART_SCAN_PROMPT,
-                        },
-                    ],
-                }
-            ],
-        )
-        return f"🔍 Chart Scan:\n\n{resp.content[0].text}"
+        resp = await asyncio.to_thread(_request_chart_scan, image_data, mime_type)
+
+        if getattr(resp, "stop_reason", None) == "refusal":
+            log.warning("Chart scan declined by safety filters")
+            return "Chart scan was declined. Try a different screenshot."
+
+        # Thinking blocks share the response with the answer, so pick the text
+        # block out rather than indexing content[0].
+        analysis = next((b.text for b in resp.content if b.type == "text"), "")
+        if not analysis.strip():
+            return "Chart scan came back empty. Send the chart again."
+
+        return f"🔍 Chart Scan:\n\n{analysis}"
     except Exception as e:
         log.error(f"Chart scan error: {e}")
         return f"Chart scan failed: {e}"
