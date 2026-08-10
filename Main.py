@@ -448,16 +448,37 @@ def ask_groq(user_message: str, price_ctx: str) -> str:
         raise
 
 
+# Chat model. Only reached when Groq is unset or fails — see ask_jarvis.
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5")
+
+
 def ask_anthropic(user_message: str, price_ctx: str) -> str:
     if not ai_client:
         raise Exception("No Anthropic key configured")
-    resp = ai_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
+
+    resp = ai_client.beta.messages.create(
+        model=CHAT_MODEL,
+        # Thinking is on by default on this model and draws from the same
+        # budget as the reply, so leave room for both.
+        max_tokens=4000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"{user_message}{price_ctx}"}],
     )
-    return resp.content[0].text
+
+    if getattr(resp, "stop_reason", None) == "refusal":
+        log.warning("Anthropic declined the chat request")
+        return "That one got declined. Rephrase it and I'll take another look."
+
+    # Thinking blocks share the response with the answer, so pick the text
+    # block out rather than indexing content[0].
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    if not text.strip():
+        raise Exception("Anthropic returned no text")
+
+    return text
 
 
 def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
@@ -876,7 +897,8 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prices   = fetch_all_prices()
         utc_hour = datetime.now(timezone.utc).hour
         session  = get_session(utc_hour)
-        reply    = ask_jarvis(
+        reply    = await asyncio.to_thread(
+            ask_jarvis,
             "Give me a quick market briefing: current session, is it a good time to trade, "
             "and what is Gold doing right now?",
             prices,
@@ -884,7 +906,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
     prices = fetch_all_prices()
-    reply  = ask_jarvis(text, prices)
+    reply  = await asyncio.to_thread(ask_jarvis, text, prices)
     await update.message.reply_text(reply)
 
 
@@ -947,7 +969,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     prices = fetch_all_prices()
-    reply  = ask_jarvis(update.message.text, prices)
+    reply  = await asyncio.to_thread(ask_jarvis, update.message.text, prices)
     await update.message.reply_text(reply)
 
 
