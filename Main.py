@@ -90,7 +90,7 @@ last_prices:    dict[str, float]       = {}
 sent_news_urls: set[str]               = set()
 last_signal_time: dict[str, float]     = {}
 last_signal_dir:  dict[str, str]       = {}
-greeted_periods:  set[str]             = set()
+last_greeted_period: str               = ""
 
 SIGNAL_COOLDOWN_SECS = 1800
 MIN_SWEEP_PIPS = {
@@ -213,17 +213,24 @@ def build_greeting(utc_hour: int) -> str:
 
 
 def check_and_send_greeting():
-    """Send greeting once per period (morning/afternoon/evening/night)."""
+    """Send one greeting each time the period changes.
+
+    Tracking only the period we last greeted means the cycle repeats every
+    day on its own. The previous version collected periods in a set that it
+    tried to clear once it held more than four — but there are only four
+    periods, so the set never grew past four and greetings stopped for good
+    after the first full day.
+    """
+    global last_greeted_period
+
     utc_hour = datetime.now(timezone.utc).hour
     period   = get_greeting_period(utc_hour)
 
-    if period not in greeted_periods:
-        greeted_periods.add(period)
-        # Clear old periods so next day works
-        if len(greeted_periods) > 4:
-            greeted_periods.clear()
-            greeted_periods.add(period)
-        safe_send(build_greeting(utc_hour))
+    if period == last_greeted_period:
+        return
+
+    last_greeted_period = period
+    safe_send(build_greeting(utc_hour))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING

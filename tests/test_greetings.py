@@ -85,7 +85,7 @@ class TestCheckAndSendGreeting:
 
         assert len(sent) == 1
         assert "🌅 Morning" in sent[0]
-        assert Main.greeted_periods == {"morning"}
+        assert Main.last_greeted_period == "morning"
 
     def test_does_not_repeat_within_the_same_period(self, at_hour, sent):
         at_hour(8)
@@ -104,22 +104,43 @@ class TestCheckAndSendGreeting:
         assert len(sent) == 2
         assert "☀️ Afternoon" in sent[1]
 
-    def test_greetings_stop_permanently_after_all_four_periods(self, at_hour, sent):
-        """Characterisation test for a live bug.
+    def test_greets_again_the_next_day(self, at_hour, sent):
+        """Regression test: greetings used to stop after the first full day.
 
-        The reset is guarded by `len(greeted_periods) > 4`, but there are only
-        four periods, so the set never exceeds four and never clears. Once all
-        four have fired, the bot greets no more until the process restarts.
+        The old reset was guarded by `len(greeted_periods) > 4` and only four
+        periods exist, so it never fired.
         """
         for hour in (8, 14, 19, 2):  # morning, afternoon, evening, night
             at_hour(hour)
             Main.check_and_send_greeting()
 
         assert len(sent) == 4
-        assert Main.greeted_periods == {"morning", "afternoon", "evening", "night"}
 
-        # A new day begins; morning should greet again but does not.
+        # Next day: the cycle starts over.
         at_hour(8)
         Main.check_and_send_greeting()
 
-        assert len(sent) == 4
+        assert len(sent) == 5
+        assert "🌅 Morning" in sent[4]
+
+    def test_keeps_cycling_across_several_days(self, at_hour, sent):
+        for _ in range(3):
+            for hour in (8, 14, 19, 2):
+                at_hour(hour)
+                Main.check_and_send_greeting()
+
+        assert len(sent) == 12
+
+    def test_polling_repeatedly_within_a_period_sends_nothing_extra(
+        self, at_hour, sent
+    ):
+        """The scanner calls this every 60s, so only period changes may fire."""
+        at_hour(8)
+        for _ in range(10):
+            Main.check_and_send_greeting()
+
+        at_hour(9)  # still morning
+        for _ in range(10):
+            Main.check_and_send_greeting()
+
+        assert len(sent) == 1

@@ -21,5 +21,5 @@ def reset_bot_state():
     Main.sent_news_urls.clear()
     Main.last_signal_time.clear()
     Main.last_signal_dir.clear()
-    Main.greeted_periods.clear()
+    Main.last_greeted_period = ""
     yield
