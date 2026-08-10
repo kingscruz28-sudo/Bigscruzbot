@@ -62,27 +62,61 @@ class TestDetectCrtSignal:
         _seed_history("XAU/USD", 2700, [2700, 2700, 2680, 2700, 2705])
         result = detect_crt_signal("XAU/USD", 2705, "ASIAN")
         assert result is not None
-        assert "🟢 BUY SIGNAL" in result
-        assert "Entry: 2705.0000" in result
-        assert "SL: 2630.0000" in result
-        assert "TP: 2855.0000" in result
+        assert (result.symbol, result.direction, result.session) == (
+            "XAU/USD",
+            "BUY",
+            "ASIAN",
+        )
+        # SL sits below the swept low, TP a full 150 pips above entry.
+        assert (result.entry, result.sl, result.tp) == (2705, 2630, 2855)
         assert Main.last_signal_dir["XAU/USD"] == "BUY"
+
+    def test_buy_signal_text_matches_levels(self):
+        _seed_history("XAU/USD", 2700, [2700, 2700, 2680, 2700, 2705])
+        result = detect_crt_signal("XAU/USD", 2705, "ASIAN")
+        assert "🟢 BUY SIGNAL" in result.text
+        assert "Entry: 2705.0000" in result.text
+        assert "SL: 2630.0000" in result.text
+        assert "TP: 2855.0000" in result.text
 
     def test_sell_signal_on_high_sweep(self):
         _seed_history("XAU/USD", 2700, [2700, 2700, 2720, 2700, 2695])
         result = detect_crt_signal("XAU/USD", 2695, "ASIAN")
         assert result is not None
-        assert "🔴 SELL SIGNAL" in result
-        assert "Entry: 2695.0000" in result
-        assert "SL: 2770.0000" in result
-        assert "TP: 2545.0000" in result
+        assert (result.symbol, result.direction, result.session) == (
+            "XAU/USD",
+            "SELL",
+            "ASIAN",
+        )
+        # SL sits above the swept high, TP a full 150 pips below entry.
+        assert (result.entry, result.sl, result.tp) == (2695, 2770, 2545)
         assert Main.last_signal_dir["XAU/USD"] == "SELL"
+
+    def test_sell_signal_text_matches_levels(self):
+        _seed_history("XAU/USD", 2700, [2700, 2700, 2720, 2700, 2695])
+        result = detect_crt_signal("XAU/USD", 2695, "ASIAN")
+        assert "🔴 SELL SIGNAL" in result.text
+        assert "Entry: 2695.0000" in result.text
+        assert "SL: 2770.0000" in result.text
+        assert "TP: 2545.0000" in result.text
 
     def test_london_session_appends_warning(self):
         _seed_history("XAU/USD", 2700, [2700, 2700, 2680, 2700, 2705])
         result = detect_crt_signal("XAU/USD", 2705, "LONDON")
         assert result is not None
-        assert "LONDON SESSION" in result
+        assert "LONDON SESSION" in result.text
+        assert result.session == "LONDON"
+
+    def test_detected_signals_always_pass_level_validation(self):
+        """Whatever the detector emits must be safe to send to the bridge."""
+        _seed_history("XAU/USD", 2700, [2700, 2700, 2680, 2700, 2705])
+        buy = detect_crt_signal("XAU/USD", 2705, "ASIAN")
+        assert Main.validate_trade_levels(buy) is None
+
+        _seed_history("BTC/USD", 90000, [90000, 90000, 95000, 90000, 89000])
+        sell = detect_crt_signal("BTC/USD", 89000, "ASIAN")
+        assert sell.direction == "SELL"
+        assert Main.validate_trade_levels(sell) is None
 
     def test_cooldown_blocks_repeat_signal(self):
         _seed_history("XAU/USD", 2700, [2700, 2700, 2680, 2700, 2705])

@@ -8,6 +8,7 @@ import feedparser
 import anthropic
 import base64
 import random
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -540,6 +541,23 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 # SIGNAL DETECTION (updated — London now included with ⚠️ warning)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@dataclass
+class TradeSignal:
+    """A detected CRT setup.
+
+    Carries the levels the MT5 bridge needs alongside the rendered Telegram
+    message, so the execution path never has to re-parse numbers back out of
+    the text it just formatted.
+    """
+    symbol: str
+    direction: str
+    entry: float
+    sl: float
+    tp: float
+    session: str
+    text: str
+
+
 def pip_size(symbol: str) -> float:
     # 1 pip = the minimum meaningful price movement for risk calculation
     if "JPY" in symbol:              return 0.01    # 1 pip = 0.01
@@ -572,7 +590,7 @@ def cooldown_ok(symbol: str) -> bool:
     return now - last_signal_time.get(symbol, 0) >= SIGNAL_COOLDOWN_SECS
 
 
-def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
+def detect_crt_signal(symbol: str, price: float, session: str) -> TradeSignal | None:
     if not is_signal_allowed(session):
         return None
 
@@ -604,12 +622,20 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             tp    = entry - tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "SELL"
-            return (
-                f"🔴 SELL SIGNAL — {name} [{session}]\n"
-                f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
-                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"Target: 150 pips | CRT + Malaysian S/R"
-                f"{london_warn}"
+            return TradeSignal(
+                symbol=symbol,
+                direction="SELL",
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                session=session,
+                text=(
+                    f"🔴 SELL SIGNAL — {name} [{session}]\n"
+                    f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
+                    f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                    f"Target: 150 pips | CRT + Malaysian S/R"
+                    f"{london_warn}"
+                ),
             )
 
     # LOW SWEEP → BUY
@@ -621,12 +647,20 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             tp    = entry + tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "BUY"
-            return (
-                f"🟢 BUY SIGNAL — {name} [{session}]\n"
-                f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
-                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"Target: 150 pips | CRT + Malaysian S/R"
-                f"{london_warn}"
+            return TradeSignal(
+                symbol=symbol,
+                direction="BUY",
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                session=session,
+                text=(
+                    f"🟢 BUY SIGNAL — {name} [{session}]\n"
+                    f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
+                    f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                    f"Target: 150 pips | CRT + Malaysian S/R"
+                    f"{london_warn}"
+                ),
             )
 
     return None
@@ -789,7 +823,7 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if found:
         for sig in found:
-            await update.message.reply_text(sig)
+            await update.message.reply_text(sig.text)
     else:
         depth = len(price_history.get("XAU/USD", []))
         london_note = "\n⚠️ London session — signals on but chop risk high." if session == "LONDON" else ""
@@ -958,7 +992,7 @@ def scanner_loop():
                 if loop_count % 5 == 0 and is_signal_allowed(session):
                     sig = detect_crt_signal(sym, price, session)
                     if sig:
-                        safe_send(sig)
+                        safe_send(sig.text)
                         if AUTO_TRADE:
                             execute_trade_via_bridge(sig)
 
@@ -1149,49 +1183,67 @@ def main():
 
 MT5_BRIDGE_URL = os.environ.get("MT5_BRIDGE_URL", "")  # Set this in Railway when bridge is running
 
-def execute_trade_via_bridge(signal_text: str):
-    """Send signal to MT5 bridge running on your laptop."""
+def validate_trade_levels(signal: TradeSignal) -> str | None:
+    """Return a reason string if these levels are unsafe to trade, else None.
+
+    Guards the direction of SL/TP relative to entry: an inverted pair would
+    otherwise reach the bridge as a live order with its risk back to front.
+    """
+    for label, value in (("entry", signal.entry), ("SL", signal.sl), ("TP", signal.tp)):
+        if value is None or value <= 0:
+            return f"{label} is not a positive price ({value})"
+
+    if signal.direction == "BUY":
+        if signal.sl >= signal.entry:
+            return f"BUY SL {signal.sl:.4f} is not below entry {signal.entry:.4f}"
+        if signal.tp <= signal.entry:
+            return f"BUY TP {signal.tp:.4f} is not above entry {signal.entry:.4f}"
+    elif signal.direction == "SELL":
+        if signal.sl <= signal.entry:
+            return f"SELL SL {signal.sl:.4f} is not above entry {signal.entry:.4f}"
+        if signal.tp >= signal.entry:
+            return f"SELL TP {signal.tp:.4f} is not below entry {signal.entry:.4f}"
+    else:
+        return f"unknown direction {signal.direction!r}"
+
+    return None
+
+
+def build_bridge_payload(signal: TradeSignal) -> dict:
+    """Payload for the MT5 bridge. Shape is unchanged from the previous
+    text-parsing version, so the bridge on the laptop needs no update."""
+    return {
+        "symbol": MT5_SYMBOL_MAP.get(signal.symbol, signal.symbol.replace("/", "")),
+        "direction": signal.direction,
+        "entry": signal.entry,
+        "sl": signal.sl,
+        "tp": signal.tp,
+        "lot": MAX_LOT,
+        "risk_percent": RISK_PERCENT,
+    }
+
+
+def execute_trade_via_bridge(signal: TradeSignal):
+    """Send a detected signal to the MT5 bridge running on your laptop."""
     if not AUTO_TRADE or not MT5_BRIDGE_URL:
         return
+
+    reason = validate_trade_levels(signal)
+    if reason:
+        log.error(f"execute_trade: refusing to send trade — {reason}")
+        safe_send(f"⚠️ Auto-trade skipped: {reason}")
+        return
+
+    payload = build_bridge_payload(signal)
+
     try:
-        direction = "BUY" if "🟢 BUY" in signal_text else "SELL" if "🔴 SELL" in signal_text else None
-        if not direction:
-            return
-
-        symbol_key = next((s for s in SYMBOLS if SYMBOLS[s] in signal_text), None)
-        if not symbol_key:
-            return
-
-        entry = sl = tp = None
-        for line in signal_text.split("\n"):
-            if "Entry:" in line:
-                try: entry = float(line.split("Entry:")[1].strip().split()[0])
-                except: pass
-            if "SL:" in line:
-                try: sl = float(line.split("SL:")[1].strip().split()[0])
-                except: pass
-            if "TP:" in line:
-                try: tp = float(line.split("TP:")[1].strip().split()[0])
-                except: pass
-
-        if not all([entry, sl, tp]):
-            log.warning("execute_trade: could not parse entry/sl/tp from signal")
-            return
-
-        payload = {
-            "symbol": MT5_SYMBOL_MAP.get(symbol_key, symbol_key.replace("/", "")),
-            "direction": direction,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "lot": MAX_LOT,
-            "risk_percent": RISK_PERCENT,
-        }
-
         r = requests.post(MT5_BRIDGE_URL, json=payload, timeout=10)
         if r.status_code == 200:
             result = r.json()
-            safe_send(f"✅ EXECUTED {direction} {SYMBOLS.get(symbol_key, symbol_key)}\nLot: {result.get('lot', MAX_LOT)} | Risk: {RISK_PERCENT}%")
+            safe_send(
+                f"✅ EXECUTED {signal.direction} {SYMBOLS.get(signal.symbol, signal.symbol)}\n"
+                f"Lot: {result.get('lot', MAX_LOT)} | Risk: {RISK_PERCENT}%"
+            )
         else:
             safe_send(f"❌ Bridge error: {r.text[:100]}")
 
