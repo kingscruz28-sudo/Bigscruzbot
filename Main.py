@@ -8,6 +8,7 @@ import feedparser
 import anthropic
 import base64
 import random
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -89,7 +90,7 @@ last_prices:    dict[str, float]       = {}
 sent_news_urls: set[str]               = set()
 last_signal_time: dict[str, float]     = {}
 last_signal_dir:  dict[str, str]       = {}
-greeted_periods:  set[str]             = set()
+last_greeted_period: str               = ""
 
 SIGNAL_COOLDOWN_SECS = 1800
 MIN_SWEEP_PIPS = {
@@ -167,11 +168,6 @@ def get_name() -> str:
     _last_name_used = name
     return name
 
-# ── Boss names — Jarvis knows who he's talking to ────────────────────────────
-BOSS_NAMES = [
-    "Scruz", "Bigscruz", "BigDawg", "Boss", "Scruman",
-]
-
 def get_boss_name() -> str:
     return random.choice(BOSS_NAMES)
 
@@ -217,17 +213,24 @@ def build_greeting(utc_hour: int) -> str:
 
 
 def check_and_send_greeting():
-    """Send greeting once per period (morning/afternoon/evening/night)."""
+    """Send one greeting each time the period changes.
+
+    Tracking only the period we last greeted means the cycle repeats every
+    day on its own. The previous version collected periods in a set that it
+    tried to clear once it held more than four — but there are only four
+    periods, so the set never grew past four and greetings stopped for good
+    after the first full day.
+    """
+    global last_greeted_period
+
     utc_hour = datetime.now(timezone.utc).hour
     period   = get_greeting_period(utc_hour)
 
-    if period not in greeted_periods:
-        greeted_periods.add(period)
-        # Clear old periods so next day works
-        if len(greeted_periods) > 4:
-            greeted_periods.clear()
-            greeted_periods.add(period)
-        safe_send(build_greeting(utc_hour))
+    if period == last_greeted_period:
+        return
+
+    last_greeted_period = period
+    safe_send(build_greeting(utc_hour))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE FETCHING
@@ -445,16 +448,37 @@ def ask_groq(user_message: str, price_ctx: str) -> str:
         raise
 
 
+# Chat model. Only reached when Groq is unset or fails — see ask_jarvis.
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5")
+
+
 def ask_anthropic(user_message: str, price_ctx: str) -> str:
     if not ai_client:
         raise Exception("No Anthropic key configured")
-    resp = ai_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
+
+    resp = ai_client.beta.messages.create(
+        model=CHAT_MODEL,
+        # Thinking is on by default on this model and draws from the same
+        # budget as the reply, so leave room for both.
+        max_tokens=4000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"{user_message}{price_ctx}"}],
     )
-    return resp.content[0].text
+
+    if getattr(resp, "stop_reason", None) == "refusal":
+        log.warning("Anthropic declined the chat request")
+        return "That one got declined. Rephrase it and I'll take another look."
+
+    # Thinking blocks share the response with the answer, so pick the text
+    # block out rather than indexing content[0].
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    if not text.strip():
+        raise Exception("Anthropic returned no text")
+
+    return text
 
 
 def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
@@ -498,6 +522,48 @@ CHART_SCAN_PROMPT = (
 )
 
 
+# Vision model for chart scans. Opus 5 reads charts far better than Haiku;
+# override via Railway if you want to trade accuracy for cost.
+CHART_SCAN_MODEL = os.environ.get("CHART_SCAN_MODEL", "claude-opus-5")
+
+
+def _request_chart_scan(image_data: str, mime_type: str):
+    """Blocking Anthropic call.
+
+    Kept separate so scan_chart_image can run it on a worker thread — the SDK
+    client is synchronous, and this model thinks before answering, so calling
+    it inline would stall every other Telegram update for the duration.
+    """
+    return ai_client.beta.messages.create(
+        model=CHART_SCAN_MODEL,
+        # Thinking is on by default on Opus 5 and shares this budget with the
+        # reply, so leave room for both.
+        max_tokens=4000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": CHART_SCAN_PROMPT,
+                    },
+                ],
+            }
+        ],
+    )
+
+
 async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """Send chart image to Anthropic Claude Vision for analysis."""
     if not ai_client:
@@ -508,30 +574,19 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 
     try:
         image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
-        resp = ai_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": CHART_SCAN_PROMPT,
-                        },
-                    ],
-                }
-            ],
-        )
-        return f"🔍 Chart Scan:\n\n{resp.content[0].text}"
+        resp = await asyncio.to_thread(_request_chart_scan, image_data, mime_type)
+
+        if getattr(resp, "stop_reason", None) == "refusal":
+            log.warning("Chart scan declined by safety filters")
+            return "Chart scan was declined. Try a different screenshot."
+
+        # Thinking blocks share the response with the answer, so pick the text
+        # block out rather than indexing content[0].
+        analysis = next((b.text for b in resp.content if b.type == "text"), "")
+        if not analysis.strip():
+            return "Chart scan came back empty. Send the chart again."
+
+        return f"🔍 Chart Scan:\n\n{analysis}"
     except Exception as e:
         log.error(f"Chart scan error: {e}")
         return f"Chart scan failed: {e}"
@@ -539,6 +594,23 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNAL DETECTION (updated — London now included with ⚠️ warning)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TradeSignal:
+    """A detected CRT setup.
+
+    Carries the levels the MT5 bridge needs alongside the rendered Telegram
+    message, so the execution path never has to re-parse numbers back out of
+    the text it just formatted.
+    """
+    symbol: str
+    direction: str
+    entry: float
+    sl: float
+    tp: float
+    session: str
+    text: str
+
 
 def pip_size(symbol: str) -> float:
     # 1 pip = the minimum meaningful price movement for risk calculation
@@ -572,7 +644,7 @@ def cooldown_ok(symbol: str) -> bool:
     return now - last_signal_time.get(symbol, 0) >= SIGNAL_COOLDOWN_SECS
 
 
-def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
+def detect_crt_signal(symbol: str, price: float, session: str) -> TradeSignal | None:
     if not is_signal_allowed(session):
         return None
 
@@ -604,12 +676,20 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             tp    = entry - tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "SELL"
-            return (
-                f"🔴 SELL SIGNAL — {name} [{session}]\n"
-                f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
-                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"Target: 150 pips | CRT + Malaysian S/R"
-                f"{london_warn}"
+            return TradeSignal(
+                symbol=symbol,
+                direction="SELL",
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                session=session,
+                text=(
+                    f"🔴 SELL SIGNAL — {name} [{session}]\n"
+                    f"High swept: {prev_high:.4f} ({sweep_high:.0f} pips)\n"
+                    f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                    f"Target: 150 pips | CRT + Malaysian S/R"
+                    f"{london_warn}"
+                ),
             )
 
     # LOW SWEEP → BUY
@@ -621,12 +701,20 @@ def detect_crt_signal(symbol: str, price: float, session: str) -> str | None:
             tp    = entry + tp_dist
             last_signal_time[symbol] = time.time()
             last_signal_dir[symbol]  = "BUY"
-            return (
-                f"🟢 BUY SIGNAL — {name} [{session}]\n"
-                f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
-                f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
-                f"Target: 150 pips | CRT + Malaysian S/R"
-                f"{london_warn}"
+            return TradeSignal(
+                symbol=symbol,
+                direction="BUY",
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                session=session,
+                text=(
+                    f"🟢 BUY SIGNAL — {name} [{session}]\n"
+                    f"Low swept: {prev_low:.4f} ({sweep_low:.0f} pips)\n"
+                    f"Entry: {entry:.4f}  SL: {sl:.4f}  TP: {tp:.4f}\n"
+                    f"Target: 150 pips | CRT + Malaysian S/R"
+                    f"{london_warn}"
+                ),
             )
 
     return None
@@ -789,7 +877,7 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if found:
         for sig in found:
-            await update.message.reply_text(sig)
+            await update.message.reply_text(sig.text)
     else:
         depth = len(price_history.get("XAU/USD", []))
         london_note = "\n⚠️ London session — signals on but chop risk high." if session == "LONDON" else ""
@@ -809,7 +897,8 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prices   = fetch_all_prices()
         utc_hour = datetime.now(timezone.utc).hour
         session  = get_session(utc_hour)
-        reply    = ask_jarvis(
+        reply    = await asyncio.to_thread(
+            ask_jarvis,
             "Give me a quick market briefing: current session, is it a good time to trade, "
             "and what is Gold doing right now?",
             prices,
@@ -817,7 +906,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
     prices = fetch_all_prices()
-    reply  = ask_jarvis(text, prices)
+    reply  = await asyncio.to_thread(ask_jarvis, text, prices)
     await update.message.reply_text(reply)
 
 
@@ -880,7 +969,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     prices = fetch_all_prices()
-    reply  = ask_jarvis(update.message.text, prices)
+    reply  = await asyncio.to_thread(ask_jarvis, update.message.text, prices)
     await update.message.reply_text(reply)
 
 
@@ -958,7 +1047,7 @@ def scanner_loop():
                 if loop_count % 5 == 0 and is_signal_allowed(session):
                     sig = detect_crt_signal(sym, price, session)
                     if sig:
-                        safe_send(sig)
+                        safe_send(sig.text)
                         if AUTO_TRADE:
                             execute_trade_via_bridge(sig)
 
@@ -1149,49 +1238,67 @@ def main():
 
 MT5_BRIDGE_URL = os.environ.get("MT5_BRIDGE_URL", "")  # Set this in Railway when bridge is running
 
-def execute_trade_via_bridge(signal_text: str):
-    """Send signal to MT5 bridge running on your laptop."""
+def validate_trade_levels(signal: TradeSignal) -> str | None:
+    """Return a reason string if these levels are unsafe to trade, else None.
+
+    Guards the direction of SL/TP relative to entry: an inverted pair would
+    otherwise reach the bridge as a live order with its risk back to front.
+    """
+    for label, value in (("entry", signal.entry), ("SL", signal.sl), ("TP", signal.tp)):
+        if value is None or value <= 0:
+            return f"{label} is not a positive price ({value})"
+
+    if signal.direction == "BUY":
+        if signal.sl >= signal.entry:
+            return f"BUY SL {signal.sl:.4f} is not below entry {signal.entry:.4f}"
+        if signal.tp <= signal.entry:
+            return f"BUY TP {signal.tp:.4f} is not above entry {signal.entry:.4f}"
+    elif signal.direction == "SELL":
+        if signal.sl <= signal.entry:
+            return f"SELL SL {signal.sl:.4f} is not above entry {signal.entry:.4f}"
+        if signal.tp >= signal.entry:
+            return f"SELL TP {signal.tp:.4f} is not below entry {signal.entry:.4f}"
+    else:
+        return f"unknown direction {signal.direction!r}"
+
+    return None
+
+
+def build_bridge_payload(signal: TradeSignal) -> dict:
+    """Payload for the MT5 bridge. Shape is unchanged from the previous
+    text-parsing version, so the bridge on the laptop needs no update."""
+    return {
+        "symbol": MT5_SYMBOL_MAP.get(signal.symbol, signal.symbol.replace("/", "")),
+        "direction": signal.direction,
+        "entry": signal.entry,
+        "sl": signal.sl,
+        "tp": signal.tp,
+        "lot": MAX_LOT,
+        "risk_percent": RISK_PERCENT,
+    }
+
+
+def execute_trade_via_bridge(signal: TradeSignal):
+    """Send a detected signal to the MT5 bridge running on your laptop."""
     if not AUTO_TRADE or not MT5_BRIDGE_URL:
         return
+
+    reason = validate_trade_levels(signal)
+    if reason:
+        log.error(f"execute_trade: refusing to send trade — {reason}")
+        safe_send(f"⚠️ Auto-trade skipped: {reason}")
+        return
+
+    payload = build_bridge_payload(signal)
+
     try:
-        direction = "BUY" if "🟢 BUY" in signal_text else "SELL" if "🔴 SELL" in signal_text else None
-        if not direction:
-            return
-
-        symbol_key = next((s for s in SYMBOLS if SYMBOLS[s] in signal_text), None)
-        if not symbol_key:
-            return
-
-        entry = sl = tp = None
-        for line in signal_text.split("\n"):
-            if "Entry:" in line:
-                try: entry = float(line.split("Entry:")[1].strip().split()[0])
-                except: pass
-            if "SL:" in line:
-                try: sl = float(line.split("SL:")[1].strip().split()[0])
-                except: pass
-            if "TP:" in line:
-                try: tp = float(line.split("TP:")[1].strip().split()[0])
-                except: pass
-
-        if not all([entry, sl, tp]):
-            log.warning("execute_trade: could not parse entry/sl/tp from signal")
-            return
-
-        payload = {
-            "symbol": MT5_SYMBOL_MAP.get(symbol_key, symbol_key.replace("/", "")),
-            "direction": direction,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "lot": MAX_LOT,
-            "risk_percent": RISK_PERCENT,
-        }
-
         r = requests.post(MT5_BRIDGE_URL, json=payload, timeout=10)
         if r.status_code == 200:
             result = r.json()
-            safe_send(f"✅ EXECUTED {direction} {SYMBOLS.get(symbol_key, symbol_key)}\nLot: {result.get('lot', MAX_LOT)} | Risk: {RISK_PERCENT}%")
+            safe_send(
+                f"✅ EXECUTED {signal.direction} {SYMBOLS.get(signal.symbol, signal.symbol)}\n"
+                f"Lot: {result.get('lot', MAX_LOT)} | Risk: {RISK_PERCENT}%"
+            )
         else:
             safe_send(f"❌ Bridge error: {r.text[:100]}")
 
