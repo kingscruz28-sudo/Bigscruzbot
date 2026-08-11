@@ -20,7 +20,7 @@ import csv
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Main reads these at import time.
 os.environ.setdefault("TELEGRAM_TOKEN", "backtest")
@@ -142,6 +142,25 @@ def load_bars(path: str) -> list[Bar]:
 
     bars.sort(key=lambda b: b.ts)
     return bars
+
+
+def slice_bars(
+    bars: list[Bar], since: str | None = None, until: str | None = None, days: int | None = None
+) -> list[Bar]:
+    """Narrow a bar list by date. `days` counts back from the last bar, which
+    is what you want when a file runs to the present and you only care about a
+    recent window."""
+    out = bars
+    if since:
+        start = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        out = [b for b in out if b.ts >= start]
+    if until:
+        end = datetime.fromisoformat(until).replace(tzinfo=timezone.utc)
+        out = [b for b in out if b.ts <= end]
+    if days and out:
+        cutoff = out[-1].ts - timedelta(days=days)
+        out = [b for b in out if b.ts >= cutoff]
+    return out
 
 
 # ── Replay ────────────────────────────────────────────────────────────────
@@ -447,6 +466,9 @@ def main(argv=None) -> int:
     run = sub.add_parser("run", help="replay an OHLC CSV through the live detector")
     run.add_argument("--csv", required=True)
     run.add_argument("--symbol", required=True, choices=sorted(Main.SYMBOLS))
+    run.add_argument("--since", help="ISO date, inclusive")
+    run.add_argument("--until", help="ISO date, inclusive")
+    run.add_argument("--days", type=int, help="window counting back from the last bar")
     run.add_argument("--spread", type=float, default=0.25, help="per leg, price units")
     run.add_argument("--slippage", type=float, default=0.10, help="per leg, price units")
 
@@ -456,7 +478,9 @@ def main(argv=None) -> int:
         print(geometry_report())
         return 0
 
-    bars = load_bars(args.csv)
+    bars = slice_bars(load_bars(args.csv), args.since, args.until, args.days)
+    if not bars:
+        raise SystemExit('no bars in that window')
     print(run_report(bars, args.symbol, args.spread, args.slippage))
     return 0
 

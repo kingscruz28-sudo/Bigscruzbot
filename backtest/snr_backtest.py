@@ -29,6 +29,7 @@ from backtest.crt_backtest import (  # noqa: E402
     Trade,
     load_bars,
     realised_r,
+    slice_bars,
     summarise,
 )
 
@@ -458,6 +459,9 @@ def main(argv=None) -> int:
     run.add_argument("--no-session-filter", action="store_true")
     run.add_argument("--loose-body-rule", action="store_true",
                      help="p21 r3: allow one close through (default). Off = strict.")
+    run.add_argument("--since", help="ISO date, inclusive")
+    run.add_argument("--until", help="ISO date, inclusive")
+    run.add_argument("--days", type=int, help="window counting back from the last bar")
     run.add_argument("--spread", type=float, default=0.25)
     run.add_argument("--slippage", type=float, default=0.10)
 
@@ -472,7 +476,9 @@ def main(argv=None) -> int:
         use_session_filter=not args.no_session_filter,
         require_second_candle_hold=not args.loose_body_rule,
     )
-    bars = load_bars(args.csv)
+    bars = slice_bars(load_bars(args.csv), args.since, args.until, args.days)
+    if not bars:
+        raise SystemExit('no bars in that window')
     print(run_report(bars, cfg, args.spread, args.slippage))
     return 0
 
