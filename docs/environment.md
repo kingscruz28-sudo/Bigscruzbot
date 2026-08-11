@@ -32,6 +32,20 @@ A bad key returns `authentication_error` instead. If the message mentions
 credit, the key is fine and rotating it changes nothing — top up, or point
 `CHART_SCAN_MODEL` at a cheaper model.
 
+### A Claude Pro or Max subscription is not API credit
+
+Two separate wallets, and paying one never funds the other:
+
+| | Covers | Billed at |
+|---|---|---|
+| Claude Pro / Max | claude.ai, the apps, Claude Code | Flat monthly subscription |
+| API credit | `ANTHROPIC_API_KEY`, so everything this bot does | Pay-as-you-go, console.anthropic.com |
+
+The key is tied to one console account, and that account's balance is what
+gets spent. A subscription on a different profile — or the same one — adds
+nothing to it. Credit must be bought on the console account the key was
+issued from, so check which account that is before topping up.
+
 Opus 5 runs thinking by default and thinking tokens are billed, so a scan
 costs several times what the same scan cost on Haiku. That is the trade for
 the accuracy gain on charts; `CHART_SCAN_MODEL` is the dial if the balance
