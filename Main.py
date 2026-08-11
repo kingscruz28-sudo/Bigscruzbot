@@ -596,13 +596,25 @@ def _request_chart_scan(image_data: str, mime_type: str):
 # Free backup reader. Groq bills separately from Anthropic, so this keeps
 # chart scanning alive when the Anthropic balance runs dry — at a real cost in
 # accuracy, which is why its output says so.
-GROQ_VISION_MODEL = os.environ.get(
-    "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
-)
+# Groq retires and renames vision models fairly often, so try a list rather
+# than pinning one. Comma-separated, first that answers wins.
+GROQ_VISION_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GROQ_VISION_MODEL",
+        "meta-llama/llama-4-maverick-17b-128e-instruct,"
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+    ).split(",")
+    if m.strip()
+]
 
 
-def _request_chart_scan_groq(image_data: str, mime_type: str) -> str:
-    """Blocking Groq vision call. OpenAI-shaped, image sent as a data URI."""
+def _request_chart_scan_groq(image_data: str, mime_type: str, model: str) -> str:
+    """Blocking Groq vision call. OpenAI-shaped, image sent as a data URI.
+
+    Raises with the response body rather than a bare status, because Groq puts
+    the useful part — an unknown model, a rate limit — in the body.
+    """
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={
@@ -610,7 +622,7 @@ def _request_chart_scan_groq(image_data: str, mime_type: str) -> str:
             "Content-Type": "application/json",
         },
         json={
-            "model": GROQ_VISION_MODEL,
+            "model": model,
             "messages": [
                 {
                     "role": "user",
@@ -629,7 +641,8 @@ def _request_chart_scan_groq(image_data: str, mime_type: str) -> str:
         },
         timeout=30,
     )
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     return r.json()["choices"][0]["message"]["content"]
 
 
@@ -641,6 +654,8 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
     it — a rough read beats an error message at 5am.
     """
     image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+    anthropic_reason = "no ANTHROPIC_API_KEY set"
+    groq_reason = "no GROQ_API_KEY set"
 
     if ai_client:
         try:
@@ -655,29 +670,37 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
             analysis = next((b.text for b in resp.content if b.type == "text"), "")
             if analysis.strip():
                 return f"🔍 Chart Scan:\n\n{analysis}"
+            anthropic_reason = "returned no text"
             log.warning("Anthropic chart scan returned no text, trying Groq")
         except Exception as e:
+            anthropic_reason = str(e)[:200]
             log.warning(f"Anthropic chart scan failed, trying Groq: {e}")
 
     if GROQ_API_KEY:
-        try:
-            analysis = await asyncio.to_thread(
-                _request_chart_scan_groq, image_data, mime_type
-            )
-            if analysis.strip():
-                return (
-                    f"🔍 Chart Scan (backup reader — {GROQ_VISION_MODEL.split('/')[-1]})\n"
-                    f"Anthropic was unavailable, so this is the weaker model. "
-                    f"Treat it as a second opinion, not a call.\n\n{analysis}"
+        groq_reason = "no vision model configured"
+        for model in GROQ_VISION_MODELS:
+            try:
+                analysis = await asyncio.to_thread(
+                    _request_chart_scan_groq, image_data, mime_type, model
                 )
-            log.error("Groq chart scan returned no text")
-        except Exception as e:
-            log.error(f"Groq chart scan failed: {e}")
+                if analysis.strip():
+                    return (
+                        f"🔍 Chart Scan (backup reader — {model.split('/')[-1]})\n"
+                        f"Anthropic was unavailable, so this is the weaker model. "
+                        f"Treat it as a second opinion, not a call.\n\n{analysis}"
+                    )
+                groq_reason = f"{model} returned no text"
+                log.error(f"Groq vision {model} returned no text")
+            except Exception as e:
+                groq_reason = f"{model.split('/')[-1]} — {str(e)[:160]}"
+                log.error(f"Groq vision {model} failed: {e}")
 
+    # Say which reader failed and why. Digging through Railway logs on a phone
+    # to find out is not a reasonable ask.
     return (
-        "⚠️ Chart scan unavailable — both readers failed.\n"
-        "Anthropic needs credit on the console account its key came from; "
-        "Groq needs GROQ_API_KEY set."
+        "⚠️ Chart scan unavailable — both readers failed.\n\n"
+        f"Anthropic: {anthropic_reason}\n\n"
+        f"Groq: {groq_reason}"
     )
 
 # ─────────────────────────────────────────────────────────────────────────────

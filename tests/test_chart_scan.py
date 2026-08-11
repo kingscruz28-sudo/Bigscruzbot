@@ -118,6 +118,13 @@ def test_empty_analysis_with_no_backup_is_reported(monkeypatch):
 
 
 def test_api_failure_is_reported_not_raised(monkeypatch):
+    """The reason is surfaced, but bounded.
+
+    The original code pasted the whole exception in — a JSON dump with a
+    request_id, unreadable on a phone. Suppressing it entirely turned out to be
+    the wrong correction: the reason is the one thing that makes the message
+    actionable. So it is kept, truncated, and labelled per provider.
+    """
     monkeypatch.setattr(
         Main, "ai_client", FakeClient(raises=ConnectionError("anthropic unreachable"))
     )
@@ -126,9 +133,15 @@ def test_api_failure_is_reported_not_raised(monkeypatch):
     result = scan()
 
     assert "unavailable" in result.lower()
-    # The raw exception used to be pasted into the reply; it belongs in the
-    # log, not in a Telegram message.
-    assert "anthropic unreachable" not in result
+    assert "anthropic unreachable" in result
+    assert len(result) < 400  # a reason, not a stack trace
+
+
+def test_long_failures_are_truncated(monkeypatch):
+    monkeypatch.setattr(Main, "ai_client", FakeClient(raises=Exception("x" * 5000)))
+    monkeypatch.setattr(Main, "GROQ_API_KEY", "")
+
+    assert len(scan()) < 400
 
 
 @pytest.mark.parametrize("mime", ["image/jpeg", "image/png", "image/webp"])
@@ -144,10 +157,11 @@ def test_passes_through_the_source_mime_type(monkeypatch, mime):
 
 
 class FakeGroqPost:
-    def __init__(self, text=None, raises=None, status=200):
+    def __init__(self, text=None, raises=None, status=200, body=""):
         self.text_out = text
         self.raises = raises
         self.status = status
+        self.body = body
         self.calls = []
 
     def __call__(self, url, headers=None, json=None, timeout=None):
@@ -156,7 +170,7 @@ class FakeGroqPost:
             raise self.raises
         return SimpleNamespace(
             status_code=self.status,
-            raise_for_status=lambda: None,
+            text=self.body,
             json=lambda: {"choices": [{"message": {"content": self.text_out}}]},
         )
 
@@ -219,15 +233,59 @@ class TestGroqFallback:
         assert image["image_url"]["url"] == "data:image/png;base64,YWJj"
         assert any(c["type"] == "text" and "CRT" in c["text"] for c in content)
 
-    def test_both_failing_reports_both(self, monkeypatch):
-        monkeypatch.setattr(Main, "ai_client", FakeClient(raises=Exception("no credit")))
+    def test_both_failing_names_each_reason(self, monkeypatch):
+        """The message has to be self-diagnosing — no log-diving on a phone."""
+        monkeypatch.setattr(
+            Main, "ai_client", FakeClient(raises=Exception("credit balance is too low"))
+        )
         monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
-        monkeypatch.setattr(Main.requests, "post", FakeGroqPost(raises=ConnectionError("groq down")))
+        monkeypatch.setattr(
+            Main.requests, "post", FakeGroqPost(raises=ConnectionError("groq down"))
+        )
 
         result = scan()
 
         assert "both readers failed" in result.lower()
-        assert "Anthropic" in result and "GROQ_API_KEY" in result
+        assert "credit balance is too low" in result
+        assert "groq down" in result
+
+    def test_reports_an_unknown_model_verbatim(self, monkeypatch):
+        """Groq puts 'model not found' in the body, not the status line."""
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main.requests,
+            "post",
+            FakeGroqPost(status=404, body='{"error":{"code":"model_not_found"}}'),
+        )
+
+        result = scan()
+
+        assert "model_not_found" in result
+
+    def test_falls_through_to_the_next_vision_model(self, monkeypatch):
+        attempts = []
+
+        def post(url, headers=None, json=None, timeout=None):
+            attempts.append(json["model"])
+            if len(attempts) == 1:
+                return SimpleNamespace(status_code=404, text="model decommissioned",
+                                       json=lambda: {})
+            return SimpleNamespace(
+                status_code=200, text="",
+                json=lambda: {"choices": [{"message": {"content": "Second model read it."}}]},
+            )
+
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/dead", "vendor/alive"])
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        result = scan()
+
+        assert attempts == ["vendor/dead", "vendor/alive"]
+        assert "Second model read it." in result
+        assert "alive" in result
 
     def test_empty_anthropic_reply_falls_through_to_groq(self, monkeypatch):
         monkeypatch.setattr(Main, "ai_client", FakeClient(response([block("text", "  ")])))
