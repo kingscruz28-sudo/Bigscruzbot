@@ -613,6 +613,85 @@ GROQ_VISION_MODELS = [
     if m.strip()
 ]
 
+# Model families that cannot read an image: speech, moderation, embeddings,
+# and Groq's agentic "compound" endpoints. Sending a chart to any of these is
+# a guaranteed wasted round-trip with a base64 payload attached.
+_NOT_IMAGE_READERS = (
+    "whisper", "tts", "guard", "embed", "compound", "playai", "distil",
+)
+
+# How many discovered models to try. Discovery is a safety net, not a
+# brute-force sweep — the image is ~100KB per attempt.
+_MAX_DISCOVERED_MODELS = 3
+
+# Cached so /models is fetched once per process rather than per scan.
+_discovered_vision_models: list | None = None
+
+
+def discover_from(models: list) -> list:
+    """Pick the plausible image readers out of a /models listing.
+
+    Groq does not reliably advertise which models accept images, so where an
+    entry carries a modality hint it is trusted and ranked first, and where it
+    does not the known non-image families are excluded and the try-loop
+    settles the rest.
+    """
+    hinted, guesses = [], []
+    for m in models:
+        model_id = m.get("id", "")
+        if not model_id or m.get("active") is False:
+            continue
+        if any(bad in model_id.lower() for bad in _NOT_IMAGE_READERS):
+            continue
+
+        # The field name varies between providers and versions, so check the
+        # plausible ones rather than assuming a shape.
+        modalities = m.get("input_modalities") or m.get("modalities") or []
+        if any("image" in str(x).lower() for x in modalities):
+            hinted.append(model_id)
+        else:
+            guesses.append(model_id)
+
+    return (hinted + guesses)[:_MAX_DISCOVERED_MODELS]
+
+
+def discover_groq_vision_models() -> list:
+    """Ask Groq what it currently hosts.
+
+    Only called once the configured models have all failed, which is exactly
+    the case that stranded this feature before: two pinned Llama 4 models were
+    retired and the bot had nothing left to try.
+    """
+    r = requests.get(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+    return discover_from(r.json().get("data", []))
+
+
+def groq_fallback_models(already_tried: list) -> list:
+    """Models to try after the configured ones have all failed.
+
+    Cached for the life of the process: if discovery has already run, a second
+    failing scan does not re-query /models.
+    """
+    global _discovered_vision_models
+
+    if _discovered_vision_models is None:
+        try:
+            _discovered_vision_models = discover_groq_vision_models()
+            log.info(f"Groq vision discovery found: {_discovered_vision_models}")
+        except Exception as e:
+            _discovered_vision_models = []
+            log.warning(f"Groq model discovery failed: {e}")
+
+    return [m for m in _discovered_vision_models if m not in already_tried]
+
+
 # Reasoning models wrap their scratchpad in <think> tags. Groq can strip it
 # server-side, but not every model accepts the parameter, so the tags get
 # removed here too.
@@ -725,7 +804,12 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 
     if GROQ_API_KEY:
         groq_reason = "no vision model configured"
-        for model in GROQ_VISION_MODELS:
+        tried = []
+
+        async def try_model(model):
+            """Returns the finished message, or None to keep going."""
+            nonlocal groq_reason
+            tried.append(model)
             try:
                 analysis = await asyncio.to_thread(
                     _request_chart_scan_groq, image_data, mime_type, model
@@ -741,6 +825,18 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
             except Exception as e:
                 groq_reason = f"{model.split('/')[-1]} — {str(e)[:160]}"
                 log.error(f"Groq vision {model} failed: {e}")
+            return None
+
+        for model in GROQ_VISION_MODELS:
+            if done := await try_model(model):
+                return done
+
+        # Only now — with every configured model spent — ask Groq what it
+        # actually hosts. Pinned names going stale is what stranded this
+        # feature before, and the answer is one request away.
+        for model in await asyncio.to_thread(groq_fallback_models, tried):
+            if done := await try_model(model):
+                return done
 
     # Say which reader failed and why. Digging through Railway logs on a phone
     # to find out is not a reasonable ask.
