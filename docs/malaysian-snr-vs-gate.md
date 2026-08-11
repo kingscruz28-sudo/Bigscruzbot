@@ -14,8 +14,13 @@ the handoff brief listed as pending item 1.
 candle's body not the wick. So, it is INVALID setup and a non-confirmatory
 touch. 2nd and 3rd touch come with wicks not bodies. So, it is a VALID and
 confirmatory setup."* p21 rule 2 restates it: *"First Touch on SNR Level must
-be SHADOW."* The settled confirmation rule was arrived at independently and
-the source agrees with it outright.
+be SHADOW."*
+
+Note on provenance: the brief recorded this rule as having been arrived at
+independently from a different school. It was not — the mentor taught from
+this document, so the gate and the book are a single source rather than two
+that agree. The rule stands, but it carries one vote, not two. The backtest is
+where a second one has to come from.
 
 **Liquidity sweep is the quality filter.** p18 is titled *SNR + LIQUIDITY
 SWEEP* and states plainly that it *"increases the odds of winning trades"*.
