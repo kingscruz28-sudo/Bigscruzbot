@@ -444,7 +444,7 @@ class TestModelDiscovery:
         """A retired pinned model must not be the end of the road."""
         self.setup_groq(monkeypatch)
         monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/retired"])
-        get = FakeModelsGet([{"id": "vendor/current"}])
+        get = FakeModelsGet([{"id": "vendor/new-vision"}])
         monkeypatch.setattr(Main.requests, "get", get)
 
         attempts = []
@@ -463,11 +463,17 @@ class TestModelDiscovery:
 
         result = scan()
 
-        assert attempts == ["vendor/retired", "vendor/current"]
+        assert attempts == ["vendor/retired", "vendor/new-vision"]
         assert "Discovered read." in result
         assert get.calls == 1
 
-    def test_speech_and_moderation_models_are_never_tried(self, monkeypatch):
+    def test_a_text_only_model_is_never_handed_an_image(self):
+        """The regression that shipped: allam-2-7b is text-only, passed the
+        old 'not obviously audio' filter, and answered 'content must be a
+        string' — which then buried the reason qwen had failed."""
+        assert Main.discover_from([{"id": "allam-2-7b"}]) == []
+
+    def test_speech_and_moderation_models_are_never_tried(self):
         """Sending a chart to Whisper is a guaranteed wasted upload."""
         models = [
             {"id": "whisper-large-v3"},
@@ -479,21 +485,30 @@ class TestModelDiscovery:
         ]
         assert Main.discover_from(models) == ["vendor/real-vision"]
 
-    def test_models_declaring_image_input_are_tried_first(self, monkeypatch):
+    def test_models_declaring_image_input_are_tried_first(self):
         models = [
-            {"id": "vendor/text-only"},
-            {"id": "vendor/sees-images", "input_modalities": ["text", "image"]},
+            {"id": "vendor/qwen-guess"},
+            {"id": "vendor/unknown-name", "input_modalities": ["text", "image"]},
         ]
 
-        assert Main.discover_from(models)[0] == "vendor/sees-images"
+        assert Main.discover_from(models)[0] == "vendor/unknown-name"
+
+    def test_a_declared_image_model_beats_an_unrecognised_name(self):
+        """Declared support is trusted even when the name says nothing."""
+        models = [{"id": "brand-new-thing", "input_modalities": ["image"]}]
+
+        assert Main.discover_from(models) == ["brand-new-thing"]
 
     def test_inactive_models_are_skipped(self):
-        models = [{"id": "vendor/dead", "active": False}, {"id": "vendor/live"}]
+        models = [
+            {"id": "vendor/dead-vision", "active": False},
+            {"id": "vendor/live-vision"},
+        ]
 
-        assert Main.discover_from(models) == ["vendor/live"]
+        assert Main.discover_from(models) == ["vendor/live-vision"]
 
     def test_the_attempt_list_is_capped(self):
-        models = [{"id": f"vendor/m{i}"} for i in range(30)]
+        models = [{"id": f"vendor/vision-{i}"} for i in range(30)]
 
         assert len(Main.discover_from(models)) <= 3
 
@@ -539,6 +554,60 @@ class TestModelDiscovery:
         assert len(post.calls) == 1
 
 
+class TestFailureReporting:
+    """The configured model's reason must survive later fallbacks failing.
+
+    Live, qwen failed and then a discovered model failed after it. Only the
+    second reason was shown, so the one fact worth having — why the real
+    vision model did not answer — was lost.
+    """
+
+    def test_the_first_models_reason_is_not_overwritten(self, monkeypatch):
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main, "GROQ_VISION_MODELS", ["qwen/qwen3.6-27b", "vendor/other-vision"]
+        )
+        monkeypatch.setattr(Main.requests, "get", FakeModelsGet([]))
+
+        def post(url, headers=None, json=None, timeout=None):
+            if json["model"].startswith("qwen"):
+                return SimpleNamespace(
+                    status_code=404, text="model has been decommissioned",
+                    json=lambda: {},
+                )
+            return SimpleNamespace(
+                status_code=400, text="content must be a string", json=lambda: {}
+            )
+
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        result = scan()
+
+        assert "decommissioned" in result
+        assert "qwen3.6-27b" in result
+
+    def test_reasons_are_flattened_onto_one_line_each(self):
+        summary = Main.summarise_failures([("vendor/a", "line one\n\nline two")])
+
+        assert summary == "a: line one line two"
+
+    def test_only_the_first_two_are_shown_with_a_count(self):
+        failures = [(f"vendor/m{i}", f"reason {i}") for i in range(5)]
+
+        summary = Main.summarise_failures(failures)
+
+        assert "reason 0" in summary
+        assert "reason 1" in summary
+        assert "reason 2" not in summary
+        assert "+3 more tried" in summary
+
+    def test_a_long_reason_is_truncated(self):
+        summary = Main.summarise_failures([("vendor/a", "x" * 900)])
+
+        assert len(summary) < 200
+
+
 class TestStripReasoning:
     def test_keeps_plain_text_untouched(self):
         assert Main.strip_reasoning("Just an answer.") == "Just an answer."
@@ -577,3 +646,67 @@ class TestAnthropicHandoff:
         monkeypatch.setattr(Main.requests, "post", FakeGroqPost("Backup got it."))
 
         assert "Backup got it." in scan()
+
+
+class TestModelsCommand:
+    """/models exists so the account's real model list settles these
+    arguments, instead of names copied out of docs."""
+
+    def reply(self, monkeypatch, models=None, status=200, body="", raises=None):
+        sent = []
+
+        class Msg:
+            async def reply_text(self, text):
+                sent.append(text)
+
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main.requests,
+            "get",
+            FakeModelsGet(models, raises=raises, status=status, body=body),
+        )
+        asyncio.run(Main.cmd_models(SimpleNamespace(message=Msg()), None))
+        return sent[0]
+
+    def test_lists_the_models_and_flags_the_readers(self, monkeypatch):
+        text = self.reply(
+            monkeypatch,
+            [{"id": "allam-2-7b"}, {"id": "qwen/qwen3-32b"}, {"id": "whisper-large-v3"}],
+        )
+
+        assert "allam-2-7b" in text  # listed, so he can see everything
+        assert "Detected as readers: qwen/qwen3-32b" in text
+        assert "3" in text
+
+    def test_says_so_when_nothing_can_read_an_image(self, monkeypatch):
+        text = self.reply(monkeypatch, [{"id": "allam-2-7b"}])
+
+        assert "Detected as readers: none" in text
+
+    def test_reports_an_http_error_rather_than_crashing(self, monkeypatch):
+        text = self.reply(monkeypatch, status=401, body="invalid api key")
+
+        assert "401" in text
+        assert "invalid api key" in text
+
+    def test_reports_an_unreachable_api(self, monkeypatch):
+        text = self.reply(monkeypatch, raises=ConnectionError("no route"))
+
+        assert "no route" in text
+
+    def test_without_a_key_it_says_so(self, monkeypatch):
+        sent = []
+
+        class Msg:
+            async def reply_text(self, text):
+                sent.append(text)
+
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "")
+        asyncio.run(Main.cmd_models(SimpleNamespace(message=Msg()), None))
+
+        assert "No GROQ_API_KEY" in sent[0]
+
+    def test_the_listing_stays_within_telegrams_limit(self, monkeypatch):
+        text = self.reply(monkeypatch, [{"id": f"vendor/model-{i}"} for i in range(500)])
+
+        assert len(text) < 4096

@@ -613,11 +613,13 @@ GROQ_VISION_MODELS = [
     if m.strip()
 ]
 
-# Model families that cannot read an image: speech, moderation, embeddings,
-# and Groq's agentic "compound" endpoints. Sending a chart to any of these is
-# a guaranteed wasted round-trip with a base64 payload attached.
-_NOT_IMAGE_READERS = (
-    "whisper", "tts", "guard", "embed", "compound", "playai", "distil",
+# Families whose names mark them as image readers. This is an allowlist on
+# purpose. The first version of this excluded the obvious non-vision families
+# instead and treated everything left as a candidate, which sent a chart to
+# allam-2-7b — a text-only model that answered "content must be a string".
+# "Not obviously audio" is not the same as "can see".
+_VISION_NAME_HINTS = (
+    "vision", "llava", "pixtral", "maverick", "scout", "llama-4", "qwen",
 )
 
 # How many discovered models to try. Discovery is a safety net, not a
@@ -629,30 +631,45 @@ _discovered_vision_models: list | None = None
 
 
 def discover_from(models: list) -> list:
-    """Pick the plausible image readers out of a /models listing.
+    """Pick the image readers out of a /models listing.
 
-    Groq does not reliably advertise which models accept images, so where an
-    entry carries a modality hint it is trusted and ranked first, and where it
-    does not the known non-image families are excluded and the try-loop
-    settles the rest.
+    Only models that either declare image input or carry a known vision family
+    name are returned. Anything else is left alone: a text model handed an
+    image fails with a confusing parameter error that then buries the reason
+    the real vision model failed, which is worse than not trying at all.
     """
-    hinted, guesses = [], []
+    declared, named = [], []
     for m in models:
         model_id = m.get("id", "")
         if not model_id or m.get("active") is False:
-            continue
-        if any(bad in model_id.lower() for bad in _NOT_IMAGE_READERS):
             continue
 
         # The field name varies between providers and versions, so check the
         # plausible ones rather than assuming a shape.
         modalities = m.get("input_modalities") or m.get("modalities") or []
         if any("image" in str(x).lower() for x in modalities):
-            hinted.append(model_id)
-        else:
-            guesses.append(model_id)
+            declared.append(model_id)
+        elif any(hint in model_id.lower() for hint in _VISION_NAME_HINTS):
+            named.append(model_id)
 
-    return (hinted + guesses)[:_MAX_DISCOVERED_MODELS]
+    # Declared image support first; family-name matches are the weaker signal.
+    return (declared + named)[:_MAX_DISCOVERED_MODELS]
+
+
+def summarise_failures(failures: list) -> str:
+    """Report why the *configured* model failed, not just the last one tried.
+
+    Each model used to overwrite the previous one's reason, so a fallback
+    failing last hid the only reason that mattered — why the real vision model
+    did not answer.
+    """
+    lines = [
+        f"{model.split('/')[-1]}: {' '.join(str(reason).split())[:140]}"
+        for model, reason in failures[:2]
+    ]
+    if len(failures) > 2:
+        lines.append(f"(+{len(failures) - 2} more tried)")
+    return "\n".join(lines)
 
 
 def discover_groq_vision_models() -> list:
@@ -804,11 +821,10 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 
     if GROQ_API_KEY:
         groq_reason = "no vision model configured"
-        tried = []
+        tried, failures = [], []
 
         async def try_model(model):
             """Returns the finished message, or None to keep going."""
-            nonlocal groq_reason
             tried.append(model)
             try:
                 analysis = await asyncio.to_thread(
@@ -820,10 +836,10 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
                         f"Anthropic was unavailable, so this is the weaker model. "
                         f"Treat it as a second opinion, not a call.\n\n{analysis}"
                     )
-                groq_reason = f"{model} returned no text"
+                failures.append((model, "returned no text"))
                 log.error(f"Groq vision {model} returned no text")
             except Exception as e:
-                groq_reason = f"{model.split('/')[-1]} — {str(e)[:160]}"
+                failures.append((model, str(e)))
                 log.error(f"Groq vision {model} failed: {e}")
             return None
 
@@ -837,6 +853,9 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
         for model in await asyncio.to_thread(groq_fallback_models, tried):
             if done := await try_model(model):
                 return done
+
+        if failures:
+            groq_reason = summarise_failures(failures)
 
     # Say which reader failed and why. Digging through Railway logs on a phone
     # to find out is not a reasonable ask.
@@ -1093,6 +1112,46 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Markets live: {n}/{len(SYMBOLS)}\n"
         f"History: {depth} candles\n"
         f"Status: 🟢 RUNNING"
+    )
+
+
+async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """List the Groq models this account can actually use.
+
+    Added because chart scanning kept failing on model names taken from docs
+    rather than from the account, and guessing from a phone at 6am is not a
+    debugging strategy.
+    """
+    if not GROQ_API_KEY:
+        await update.message.reply_text("No GROQ_API_KEY set.")
+        return
+
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            await update.message.reply_text(f"Groq HTTP {r.status_code}: {r.text[:200]}")
+            return
+        models = r.json().get("data", [])
+    except Exception as e:
+        await update.message.reply_text(f"Could not reach Groq: {str(e)[:200]}")
+        return
+
+    readers = discover_from(models)
+    configured = ", ".join(GROQ_VISION_MODELS) or "none"
+    ids = sorted(m.get("id", "") for m in models if m.get("id"))
+
+    # Telegram caps messages at 4096 characters.
+    listing = "\n".join(f"• {i}" for i in ids)[:3000]
+    await update.message.reply_text(
+        f"🧠 Groq models ({len(ids)})\n\n"
+        f"Configured for vision: {configured}\n"
+        f"Detected as readers: {', '.join(readers) or 'none'}\n\n"
+        f"{listing}"
     )
 
 
@@ -1457,6 +1516,7 @@ def main():
     app.add_handler(CommandHandler("price",   cmd_price))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("news",    cmd_news))
+    app.add_handler(CommandHandler("models",  cmd_models))
     app.add_handler(CommandHandler("signal",  cmd_signal))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("chat",    cmd_chat))
