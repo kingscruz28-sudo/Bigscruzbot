@@ -602,6 +602,9 @@ GROQ_VISION_MODELS = [
     m.strip()
     for m in os.environ.get(
         "GROQ_VISION_MODEL",
+        # Groq's own vision docs name this one for image input, so it leads.
+        "qwen/qwen3.6-27b,"
+        # Kept behind it only as fallbacks if that model is ever retired.
         "meta-llama/llama-4-maverick-17b-128e-instruct,"
         "meta-llama/llama-4-scout-17b-16e-instruct",
     ).split(",")
