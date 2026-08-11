@@ -593,32 +593,92 @@ def _request_chart_scan(image_data: str, mime_type: str):
     )
 
 
+# Free backup reader. Groq bills separately from Anthropic, so this keeps
+# chart scanning alive when the Anthropic balance runs dry — at a real cost in
+# accuracy, which is why its output says so.
+GROQ_VISION_MODEL = os.environ.get(
+    "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
+
+
+def _request_chart_scan_groq(image_data: str, mime_type: str) -> str:
+    """Blocking Groq vision call. OpenAI-shaped, image sent as a data URI."""
+    r = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_VISION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": CHART_SCAN_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_data}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 500,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
 async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
-    """Send chart image to Anthropic Claude Vision for analysis."""
-    if not ai_client:
-        return (
-            "⚠️ Chart scan needs ANTHROPIC_API_KEY.\n"
-            "Add it to Railway variables and top up $5 at console.anthropic.com"
-        )
+    """Read a chart. Anthropic first, Groq as a free backup.
 
-    try:
-        image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
-        resp = await asyncio.to_thread(_request_chart_scan, image_data, mime_type)
+    Anthropic reads charts far better, so it is always tried first. Groq exists
+    so that an empty Anthropic balance degrades the feature instead of killing
+    it — a rough read beats an error message at 5am.
+    """
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-        if getattr(resp, "stop_reason", None) == "refusal":
-            log.warning("Chart scan declined by safety filters")
-            return "Chart scan was declined. Try a different screenshot."
+    if ai_client:
+        try:
+            resp = await asyncio.to_thread(_request_chart_scan, image_data, mime_type)
 
-        # Thinking blocks share the response with the answer, so pick the text
-        # block out rather than indexing content[0].
-        analysis = next((b.text for b in resp.content if b.type == "text"), "")
-        if not analysis.strip():
-            return "Chart scan came back empty. Send the chart again."
+            if getattr(resp, "stop_reason", None) == "refusal":
+                log.warning("Chart scan declined by safety filters")
+                return "Chart scan was declined. Try a different screenshot."
 
-        return f"🔍 Chart Scan:\n\n{analysis}"
-    except Exception as e:
-        log.error(f"Chart scan error: {e}")
-        return f"Chart scan failed: {e}"
+            # Thinking blocks share the response with the answer, so pick the
+            # text block out rather than indexing content[0].
+            analysis = next((b.text for b in resp.content if b.type == "text"), "")
+            if analysis.strip():
+                return f"🔍 Chart Scan:\n\n{analysis}"
+            log.warning("Anthropic chart scan returned no text, trying Groq")
+        except Exception as e:
+            log.warning(f"Anthropic chart scan failed, trying Groq: {e}")
+
+    if GROQ_API_KEY:
+        try:
+            analysis = await asyncio.to_thread(
+                _request_chart_scan_groq, image_data, mime_type
+            )
+            if analysis.strip():
+                return (
+                    f"🔍 Chart Scan (backup reader — {GROQ_VISION_MODEL.split('/')[-1]})\n"
+                    f"Anthropic was unavailable, so this is the weaker model. "
+                    f"Treat it as a second opinion, not a call.\n\n{analysis}"
+                )
+            log.error("Groq chart scan returned no text")
+        except Exception as e:
+            log.error(f"Groq chart scan failed: {e}")
+
+    return (
+        "⚠️ Chart scan unavailable — both readers failed.\n"
+        "Anthropic needs credit on the console account its key came from; "
+        "Groq needs GROQ_API_KEY set."
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNAL DETECTION (updated — London now included with ⚠️ warning)
