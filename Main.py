@@ -606,10 +606,7 @@ GROQ_VISION_MODELS = [
         "qwen/qwen3.6-27b,"
         # Kept behind it only as fallbacks if that model is ever retired.
         "meta-llama/llama-4-maverick-17b-128e-instruct,"
-        "meta-llama/llama-4-scout-17b-16e-instruct,"
-        # Spotted live in the Groq console. Vision support unconfirmed — if it
-        # is text-only it will reject the image and the next candidate runs.
-        "qwen/qwen3.6-27b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
     ).split(",")
     if m.strip()
 ]
