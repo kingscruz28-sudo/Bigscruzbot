@@ -109,9 +109,59 @@ implements the SNR gate, `Main.py` implements something else.
 
 ---
 
+## The entry sequence (p28-29)
+
+These two pages are the most mechanical in the book, and they change the shape
+of the EA. The entry is not a single trigger on a level touch — it is a
+sequence that has to complete in order.
+
+p28, *"Simple rules to stardom"*:
+
+```
+IMPULSE            @ the engulfing zone
+   ↓
+SIDEWAYS (SW1)     refine to LTF here
+   ↓
+IMPULSE            toward the HTF zone
+   ↓
+SIDEWAYS (SW2)     inside the HTF zone
+   ↓
+ENGULFING BO       breakout confirmation
+   ↓
+ENTER TRADE        safe stop at the higher high
+```
+
+The same page frames the swing structure as alternating ranges off one HTF
+engulfing zone: upward impulse into Range 1, sell the engulfing break there;
+downward impulse into Range 2, buy the engulfing break there. Re-entry is
+explicitly allowed — *"engulfing → retest → BO → re-entry"*.
+
+p29 gives the confirmation chain as a single line: **HTF setup →
+confirmation → entry at LTF breakout.**
+
+- **HTF**: a bearish (selling) or bullish (buying) candle at the SNR.
+- **Confirmation**: an HTF price-rejection candle — pin bar or engulfing.
+- **Entry**: drop to LTF, enter on the breakout of the engulfing zone.
+- **Stop**: at the engulfing zone boundary, above for a sell, below for a buy.
+
+p29 also splits the setups into **continuation** and **reversal** patterns,
+both drawn as a 1→2 leg structure, so the same machinery covers with-trend and
+counter-trend entries.
+
+### What this means for `JarvisSNR.mq5`
+
+The EA currently implements the **trigger** — level construction, MISS
+validation, wick-touch, stacking, session — and then enters on the touch with
+a swing-based stop. That is the risk entry from p17, not the confirmatory one.
+
+The confirmation chain above is not implemented. Adding it means a per-level
+state machine (impulse → SW1 → impulse → SW2 → engulfing breakout) and moving
+the stop from the swing extreme to the engulfing zone edge. Worth doing before
+reading much into a backtest, since the book's own numbers assume the
+confirmed entry rather than the touch.
+
 ## Still unread
 
-36 pages are chart images. The ones carrying rules have been read (17, 18, 21,
-74). The remainder are worked examples across GBPJPY, Step Index, V75 and Gold
-— useful for calibration, not for new rules. Pages 28-29 (engulfing trading
-steps, entry confirmation) are worth a pass before the engulfing leg is coded.
+The remaining chart pages are worked examples across GBPJPY, Step Index, V75
+and Gold — useful for calibrating what a valid touch looks like by eye, but
+they carry no rules that are not already stated in the text pages above.
