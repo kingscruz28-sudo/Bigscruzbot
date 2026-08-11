@@ -123,3 +123,17 @@ not configuration.
 Kaggle credentials have no effect here. Nothing in the bot downloads datasets —
 that is backtesting work, which runs on a machine with the data, not on the
 Telegram host.
+
+## Commitment of Traders
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `COT_MARKET_CODE` | `088691` | `/cot` | CFTC contract code. The default is COMEX Gold. `/cot <code>` overrides it per call without changing this. |
+
+The CFTC feed is open — no key, no account, no quota to manage. Rows come back
+from Socrata with every number as a *string*, and empty columns omitted rather
+than sent as null, so the parsing coerces defensively.
+
+The report is measured on a Tuesday and published the following Friday, so it
+is structurally a few days behind price. It is positioning context for a level
+you already have, not an entry trigger, and the command's output says so.

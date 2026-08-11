@@ -334,6 +334,111 @@ def fetch_all_prices() -> dict[str, float | None]:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COMMITMENT OF TRADERS — who is actually positioned, and which way
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The CFTC publishes positioning weekly, free, no key. This is the legacy
+# futures-only report; the dataset id and field names come from the CFTC's
+# own Socrata tables rather than being guessed.
+COT_DATASET = "6dca-aqww"
+COT_URL = f"https://publicreporting.cftc.gov/resource/{COT_DATASET}.json"
+
+# COMEX Gold. Overridable so the same command can be pointed at another
+# contract without a code change.
+COT_MARKET_CODE = os.environ.get("COT_MARKET_CODE", "088691")
+
+
+def fetch_cot(code: str = None, weeks: int = 2) -> list:
+    """Fetch the most recent COT reports for one contract, newest first."""
+    r = requests.get(
+        COT_URL,
+        params={
+            "cftc_contract_market_code": code or COT_MARKET_CODE,
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$limit": weeks,
+        },
+        timeout=20,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def _int(row: dict, key: str) -> int:
+    """Socrata returns every number as a string, and omits empty columns."""
+    try:
+        return int(float(row.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def summarise_cot(rows: list) -> str:
+    """Turn COT rows into a positioning read.
+
+    Two groups matter. Non-commercials are the large speculators — funds
+    trading it to make money, so their net position is the trend crowd.
+    Commercials are the hedgers — miners and refiners with the physical metal,
+    structurally short and usually on the other side.
+    """
+    if not rows:
+        return "No COT data returned for that contract."
+
+    now = rows[0]
+    date = str(now.get("report_date_as_yyyy_mm_dd", ""))[:10]
+    name = now.get("market_and_exchange_names", "Unknown contract").strip()
+
+    spec_net = _int(now, "noncomm_positions_long_all") - _int(
+        now, "noncomm_positions_short_all"
+    )
+    comm_net = _int(now, "comm_positions_long_all") - _int(
+        now, "comm_positions_short_all"
+    )
+    oi = _int(now, "open_interest_all")
+
+    lines = [
+        f"📊 COT — {name}",
+        f"Report week: {date}",
+        "",
+        f"Large specs net: {spec_net:+,}",
+        f"Commercials net: {comm_net:+,}",
+        f"Open interest: {oi:,}",
+    ]
+
+    if len(rows) > 1:
+        prev = rows[1]
+        prev_spec = _int(prev, "noncomm_positions_long_all") - _int(
+            prev, "noncomm_positions_short_all"
+        )
+        change = spec_net - prev_spec
+        direction = "added longs" if change > 0 else "cut longs"
+        lines.append(f"Week on week: {change:+,} ({direction})")
+
+    lean = "long" if spec_net > 0 else "short" if spec_net < 0 else "flat"
+    lines += [
+        "",
+        f"Specs are net {lean}. Commercials sit opposite by construction, so"
+        " that alone is not a signal — it is context for a level you already"
+        " have.",
+        "",
+        "⏳ Weekly data, measured Tuesday and published Friday, so it is"
+        " always a few days behind price.",
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_cot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    code = ctx.args[0] if getattr(ctx, "args", None) else None
+    try:
+        rows = await asyncio.to_thread(fetch_cot, code)
+    except Exception as e:
+        log.error(f"COT fetch failed: {e}")
+        await update.message.reply_text(f"Could not reach the CFTC: {str(e)[:200]}")
+        return
+
+    await update.message.reply_text(summarise_cot(rows))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FEATURE 2 — NEWS → PAIR ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1517,6 +1622,7 @@ def main():
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("news",    cmd_news))
     app.add_handler(CommandHandler("models",  cmd_models))
+    app.add_handler(CommandHandler("cot",     cmd_cot))
     app.add_handler(CommandHandler("signal",  cmd_signal))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("chat",    cmd_chat))
