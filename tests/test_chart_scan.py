@@ -287,6 +287,290 @@ class TestGroqFallback:
         assert "Second model read it." in result
         assert "alive" in result
 
+    def test_reasoning_scratchpad_never_reaches_the_user(self, monkeypatch):
+        """qwen thinks in <think> tags. Shipping that to Telegram sent him a
+        model arguing with itself instead of a read."""
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main.requests,
+            "post",
+            FakeGroqPost(
+                "<think>Wait, let me re-read the labels. Is it 64,118?</think>\n"
+                "Resistance at 64,100. Wait for the sweep."
+            ),
+        )
+
+        result = scan()
+
+        assert "<think>" not in result
+        assert "re-read the labels" not in result
+        assert "Resistance at 64,100. Wait for the sweep." in result
+
+    def test_asks_groq_to_hide_the_scratchpad(self, monkeypatch):
+        post = FakeGroqPost("ok")
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        scan()
+
+        assert post.calls[0]["json"]["reasoning_format"] == "hidden"
+
+    def test_retries_without_the_parameter_when_the_model_rejects_it(self, monkeypatch):
+        """Not every Groq model knows reasoning_format. A 400 on it must not
+        burn the model — the tags get stripped locally instead."""
+        bodies = []
+
+        def post(url, headers=None, json=None, timeout=None):
+            bodies.append(json)
+            if "reasoning_format" in json:
+                return SimpleNamespace(
+                    status_code=400,
+                    text='{"error":{"message":"reasoning_format not supported"}}',
+                    json=lambda: {},
+                )
+            return SimpleNamespace(
+                status_code=200,
+                text="",
+                json=lambda: {
+                    "choices": [{"message": {"content": "<think>hm</think>Clean read."}}]
+                },
+            )
+
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        result = scan()
+
+        assert len(bodies) == 2
+        assert "reasoning_format" not in bodies[1]
+        assert "Clean read." in result
+        assert "<think>" not in result
+
+    def test_a_400_unrelated_to_reasoning_is_not_retried(self, monkeypatch):
+        post = FakeGroqPost(status=400, body='{"error":{"code":"rate_limit"}}')
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        result = scan()
+
+        assert len(post.calls) == 1
+        assert "rate_limit" in result
+
+    def test_leaves_room_for_thinking_and_the_answer(self, monkeypatch):
+        """500 tokens went entirely on thinking and the reply was cut off."""
+        post = FakeGroqPost("ok")
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        scan()
+
+        assert post.calls[0]["json"]["max_tokens"] >= 2000
+
+    def test_thinking_that_never_finished_is_a_failure_not_a_read(self, monkeypatch):
+        """An unclosed <think> is a truncated monologue. Reporting it as
+        unavailable beats presenting it as analysis."""
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main.requests,
+            "post",
+            FakeGroqPost("<think>The user wants analysis. Let's look at the"),
+        )
+
+        result = scan()
+
+        assert "unavailable" in result.lower()
+        assert "budget" in result.lower()
+        assert "Let's look at the" not in result
+
+    def test_discovery_is_skipped_when_a_configured_model_answers(self, monkeypatch):
+        """The happy path stays one request. Discovery is a safety net."""
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(Main.requests, "post", FakeGroqPost("Read it."))
+
+        def explode(*a, **k):
+            raise AssertionError("/models should not be called")
+
+        monkeypatch.setattr(Main.requests, "get", explode)
+
+        assert "Read it." in scan()
+
+    def test_dead_llama_models_are_gone_from_the_defaults(self):
+        """Both returned 'model not found' on his account, so they only cost
+        a wasted round-trip on the way to the real failure."""
+        assert Main.GROQ_VISION_MODELS == ["qwen/qwen3.6-27b"]
+
+
+class FakeModelsGet:
+    """Stands in for GET /models."""
+
+    def __init__(self, models=None, raises=None, status=200, body=""):
+        self.models = models or []
+        self.raises = raises
+        self.status = status
+        self.body = body
+        self.calls = 0
+
+    def __call__(self, url, headers=None, timeout=None):
+        self.calls += 1
+        if self.raises:
+            raise self.raises
+        return SimpleNamespace(
+            status_code=self.status,
+            text=self.body,
+            json=lambda: {"data": self.models},
+        )
+
+
+@pytest.fixture(autouse=True)
+def reset_discovery_cache():
+    Main._discovered_vision_models = None
+    yield
+    Main._discovered_vision_models = None
+
+
+class TestModelDiscovery:
+    def setup_groq(self, monkeypatch):
+        monkeypatch.setattr(Main, "ai_client", None)
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+
+    def test_discovery_runs_once_the_configured_models_are_spent(self, monkeypatch):
+        """A retired pinned model must not be the end of the road."""
+        self.setup_groq(monkeypatch)
+        monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/retired"])
+        get = FakeModelsGet([{"id": "vendor/current"}])
+        monkeypatch.setattr(Main.requests, "get", get)
+
+        attempts = []
+
+        def post(url, headers=None, json=None, timeout=None):
+            attempts.append(json["model"])
+            if json["model"] == "vendor/retired":
+                return SimpleNamespace(status_code=404, text="model not found",
+                                       json=lambda: {})
+            return SimpleNamespace(
+                status_code=200, text="",
+                json=lambda: {"choices": [{"message": {"content": "Discovered read."}}]},
+            )
+
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        result = scan()
+
+        assert attempts == ["vendor/retired", "vendor/current"]
+        assert "Discovered read." in result
+        assert get.calls == 1
+
+    def test_speech_and_moderation_models_are_never_tried(self, monkeypatch):
+        """Sending a chart to Whisper is a guaranteed wasted upload."""
+        models = [
+            {"id": "whisper-large-v3"},
+            {"id": "playai-tts"},
+            {"id": "meta-llama/llama-guard-4-12b"},
+            {"id": "text-embedding-3"},
+            {"id": "groq/compound-mini"},
+            {"id": "vendor/real-vision"},
+        ]
+        assert Main.discover_from(models) == ["vendor/real-vision"]
+
+    def test_models_declaring_image_input_are_tried_first(self, monkeypatch):
+        models = [
+            {"id": "vendor/text-only"},
+            {"id": "vendor/sees-images", "input_modalities": ["text", "image"]},
+        ]
+
+        assert Main.discover_from(models)[0] == "vendor/sees-images"
+
+    def test_inactive_models_are_skipped(self):
+        models = [{"id": "vendor/dead", "active": False}, {"id": "vendor/live"}]
+
+        assert Main.discover_from(models) == ["vendor/live"]
+
+    def test_the_attempt_list_is_capped(self):
+        models = [{"id": f"vendor/m{i}"} for i in range(30)]
+
+        assert len(Main.discover_from(models)) <= 3
+
+    def test_a_failed_discovery_does_not_break_the_scan(self, monkeypatch):
+        """No key, no network, a 500 — the scan still reports honestly."""
+        self.setup_groq(monkeypatch)
+        monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/retired"])
+        monkeypatch.setattr(
+            Main.requests, "get", FakeModelsGet(raises=ConnectionError("no route"))
+        )
+        monkeypatch.setattr(
+            Main.requests, "post", FakeGroqPost(status=404, body="model not found")
+        )
+
+        result = scan()
+
+        assert "unavailable" in result.lower()
+        assert "model not found" in result
+
+    def test_discovery_is_not_repeated_on_the_next_failing_scan(self, monkeypatch):
+        self.setup_groq(monkeypatch)
+        monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/retired"])
+        get = FakeModelsGet([])
+        monkeypatch.setattr(Main.requests, "get", get)
+        monkeypatch.setattr(
+            Main.requests, "post", FakeGroqPost(status=404, body="gone")
+        )
+
+        scan()
+        scan()
+
+        assert get.calls == 1
+
+    def test_a_model_already_tried_is_not_tried_again(self, monkeypatch):
+        self.setup_groq(monkeypatch)
+        monkeypatch.setattr(Main, "GROQ_VISION_MODELS", ["vendor/same"])
+        monkeypatch.setattr(Main.requests, "get", FakeModelsGet([{"id": "vendor/same"}]))
+        post = FakeGroqPost(status=404, body="gone")
+        monkeypatch.setattr(Main.requests, "post", post)
+
+        scan()
+
+        assert len(post.calls) == 1
+
+
+class TestStripReasoning:
+    def test_keeps_plain_text_untouched(self):
+        assert Main.strip_reasoning("Just an answer.") == "Just an answer."
+
+    def test_removes_a_closed_block(self):
+        assert Main.strip_reasoning("<think>noise</think>Answer.") == "Answer."
+
+    def test_removes_several_blocks(self):
+        text = "<think>a</think>One. <think>b</think>Two."
+        assert Main.strip_reasoning(text) == "One. Two."
+
+    def test_matches_across_newlines(self):
+        assert Main.strip_reasoning("<think>line\nline</think>Done.") == "Done."
+
+    def test_drops_an_unterminated_block_and_all_that_follows(self):
+        assert Main.strip_reasoning("Lead.\n<think>cut off mid-thou") == "Lead."
+
+    def test_is_case_insensitive(self):
+        assert Main.strip_reasoning("<THINK>x</THINK>Answer.") == "Answer."
+
+
+class TestGroqChat:
+    def test_chat_replies_are_stripped_too(self, monkeypatch):
+        monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")
+        monkeypatch.setattr(
+            Main.requests, "post", FakeGroqPost("<think>hmm</think>London is live.")
+        )
+
+        assert Main.ask_groq("what session", "") == "London is live."
+
+
+class TestAnthropicHandoff:
     def test_empty_anthropic_reply_falls_through_to_groq(self, monkeypatch):
         monkeypatch.setattr(Main, "ai_client", FakeClient(response([block("text", "  ")])))
         monkeypatch.setattr(Main, "GROQ_API_KEY", "groq-key")

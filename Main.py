@@ -471,7 +471,9 @@ def ask_groq(user_message: str, price_ctx: str) -> str:
             timeout=15,
         )
         data = r.json()
-        return data["choices"][0]["message"]["content"]
+        # Harmless on the current model, which does not think out loud, but
+        # keeps a future swap to a reasoning model from leaking a scratchpad.
+        return strip_reasoning(data["choices"][0]["message"]["content"] or "")
     except Exception as e:
         log.error(f"Groq error: {e}")
         raise
@@ -602,14 +604,113 @@ GROQ_VISION_MODELS = [
     m.strip()
     for m in os.environ.get(
         "GROQ_VISION_MODEL",
-        # Groq's own vision docs name this one for image input, so it leads.
-        "qwen/qwen3.6-27b,"
-        # Kept behind it only as fallbacks if that model is ever retired.
-        "meta-llama/llama-4-maverick-17b-128e-instruct,"
-        "meta-llama/llama-4-scout-17b-16e-instruct",
+        # Groq's own vision docs name this one for image input, and it is the
+        # only one confirmed to answer on this account. Both Llama 4 vision
+        # models were tried and returned "model not found", so they are gone
+        # rather than sitting here burning a round-trip on every failure.
+        "qwen/qwen3.6-27b",
     ).split(",")
     if m.strip()
 ]
+
+# Model families that cannot read an image: speech, moderation, embeddings,
+# and Groq's agentic "compound" endpoints. Sending a chart to any of these is
+# a guaranteed wasted round-trip with a base64 payload attached.
+_NOT_IMAGE_READERS = (
+    "whisper", "tts", "guard", "embed", "compound", "playai", "distil",
+)
+
+# How many discovered models to try. Discovery is a safety net, not a
+# brute-force sweep — the image is ~100KB per attempt.
+_MAX_DISCOVERED_MODELS = 3
+
+# Cached so /models is fetched once per process rather than per scan.
+_discovered_vision_models: list | None = None
+
+
+def discover_from(models: list) -> list:
+    """Pick the plausible image readers out of a /models listing.
+
+    Groq does not reliably advertise which models accept images, so where an
+    entry carries a modality hint it is trusted and ranked first, and where it
+    does not the known non-image families are excluded and the try-loop
+    settles the rest.
+    """
+    hinted, guesses = [], []
+    for m in models:
+        model_id = m.get("id", "")
+        if not model_id or m.get("active") is False:
+            continue
+        if any(bad in model_id.lower() for bad in _NOT_IMAGE_READERS):
+            continue
+
+        # The field name varies between providers and versions, so check the
+        # plausible ones rather than assuming a shape.
+        modalities = m.get("input_modalities") or m.get("modalities") or []
+        if any("image" in str(x).lower() for x in modalities):
+            hinted.append(model_id)
+        else:
+            guesses.append(model_id)
+
+    return (hinted + guesses)[:_MAX_DISCOVERED_MODELS]
+
+
+def discover_groq_vision_models() -> list:
+    """Ask Groq what it currently hosts.
+
+    Only called once the configured models have all failed, which is exactly
+    the case that stranded this feature before: two pinned Llama 4 models were
+    retired and the bot had nothing left to try.
+    """
+    r = requests.get(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+    return discover_from(r.json().get("data", []))
+
+
+def groq_fallback_models(already_tried: list) -> list:
+    """Models to try after the configured ones have all failed.
+
+    Cached for the life of the process: if discovery has already run, a second
+    failing scan does not re-query /models.
+    """
+    global _discovered_vision_models
+
+    if _discovered_vision_models is None:
+        try:
+            _discovered_vision_models = discover_groq_vision_models()
+            log.info(f"Groq vision discovery found: {_discovered_vision_models}")
+        except Exception as e:
+            _discovered_vision_models = []
+            log.warning(f"Groq model discovery failed: {e}")
+
+    return [m for m in _discovered_vision_models if m not in already_tried]
+
+
+# Reasoning models wrap their scratchpad in <think> tags. Groq can strip it
+# server-side, but not every model accepts the parameter, so the tags get
+# removed here too.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Return the answer only, with any reasoning scratchpad removed.
+
+    An *unclosed* <think> means the model ran out of budget mid-thought: there
+    is no answer after it, only half a monologue. Returning nothing in that
+    case is honest — the caller reports a failure instead of presenting
+    the model talking to itself as analysis.
+    """
+    cleaned = _THINK_BLOCK.sub("", text)
+    lowered = cleaned.lower()
+    if "<think>" in lowered:
+        cleaned = cleaned[: lowered.index("<think>")]
+    return cleaned.strip()
 
 
 def _request_chart_scan_groq(image_data: str, mime_type: str, model: str) -> str:
@@ -618,35 +719,57 @@ def _request_chart_scan_groq(image_data: str, mime_type: str, model: str) -> str
     Raises with the response body rather than a bare status, because Groq puts
     the useful part — an unknown model, a rate limit — in the body.
     """
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": CHART_SCAN_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{image_data}"
-                            },
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CHART_SCAN_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}"
                         },
-                    ],
-                }
-            ],
-            "max_tokens": 500,
-        },
-        timeout=30,
-    )
+                    },
+                ],
+            }
+        ],
+        # Reasoning tokens come out of this same budget. At 500 the model
+        # spent the lot thinking and the reply was truncated mid-sentence,
+        # so there is room for both now.
+        "max_tokens": 2000,
+        # Ask Groq to drop the scratchpad server-side. Not every model takes
+        # this parameter — see the retry below.
+        "reasoning_format": "hidden",
+    }
+
+    def post(body):
+        return requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+
+    r = post(payload)
+    if r.status_code == 400 and "reasoning" in r.text.lower():
+        # This model does not know the parameter. Drop it and try once more;
+        # strip_reasoning below handles the tags that then come back.
+        payload.pop("reasoning_format", None)
+        r = post(payload)
+
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    return r.json()["choices"][0]["message"]["content"]
+
+    content = r.json()["choices"][0]["message"]["content"] or ""
+    answer = strip_reasoning(content)
+    if content.strip() and not answer:
+        raise RuntimeError("spent its whole token budget thinking, no answer left")
+    return answer
 
 
 async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
@@ -681,7 +804,12 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 
     if GROQ_API_KEY:
         groq_reason = "no vision model configured"
-        for model in GROQ_VISION_MODELS:
+        tried = []
+
+        async def try_model(model):
+            """Returns the finished message, or None to keep going."""
+            nonlocal groq_reason
+            tried.append(model)
             try:
                 analysis = await asyncio.to_thread(
                     _request_chart_scan_groq, image_data, mime_type, model
@@ -697,6 +825,18 @@ async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
             except Exception as e:
                 groq_reason = f"{model.split('/')[-1]} — {str(e)[:160]}"
                 log.error(f"Groq vision {model} failed: {e}")
+            return None
+
+        for model in GROQ_VISION_MODELS:
+            if done := await try_model(model):
+                return done
+
+        # Only now — with every configured model spent — ask Groq what it
+        # actually hosts. Pinned names going stale is what stranded this
+        # feature before, and the answer is one request away.
+        for model in await asyncio.to_thread(groq_fallback_models, tried):
+            if done := await try_model(model):
+                return done
 
     # Say which reader failed and why. Digging through Railway logs on a phone
     # to find out is not a reasonable ask.

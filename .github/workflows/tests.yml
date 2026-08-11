@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a run be started by hand. Without this, a pull_request event that
+  # never queues leaves no way to get a result short of closing and
+  # reopening the PR.
+  workflow_dispatch:
 
 jobs:
   pytest:
