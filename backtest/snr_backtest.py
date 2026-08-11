@@ -232,25 +232,42 @@ def collect_signals(m1: list[Bar], cfg: SnrConfig) -> SnrRun:
         "passed_miss": 0,
         "passed_stacking": 0,
         "signals": 0,
+        "level_rebuilds": 0,
     }
 
     run = SnrRun(stats=counts)
     levels: list[Level] = []
-    last_htf_ts: datetime | None = None
     open_until: datetime | None = None
+
+    # How many HTF bars have fully closed. Entry bars only move forward, so
+    # this pointer only ever advances — rescanning the whole HTF series on
+    # every entry bar made the run quadratic and unusable on multi-year files.
+    htf_width = timedelta(minutes=TIMEFRAMES[cfg.level_tf])
+    htf_closed_count = 0
+    lookback = cfg.level_lookback
 
     for index, bar in enumerate(entry):
         if index < 2:
             continue
         counts["entry_bars"] += 1
 
-        # Rebuild levels once per completed HTF bar, using only bars that
-        # closed before this entry bar — no look-ahead.
-        htf_closed = [h for h in htf_all if h.ts + timedelta(
-            minutes=TIMEFRAMES[cfg.level_tf]) <= bar.ts]
-        if htf_closed and (last_htf_ts is None or htf_closed[-1].ts != last_htf_ts):
-            levels = build_levels(htf_closed, cfg)
-            last_htf_ts = htf_closed[-1].ts
+        # Advance over any HTF bars that closed before this entry bar, and
+        # rebuild only when at least one new one has. No look-ahead: a bar is
+        # only visible once its close is in the past.
+        rebuilt = False
+        while (
+            htf_closed_count < len(htf_all)
+            and htf_all[htf_closed_count].ts + htf_width <= bar.ts
+        ):
+            htf_closed_count += 1
+            rebuilt = True
+
+        if rebuilt and htf_closed_count:
+            counts["level_rebuilds"] += 1
+            # Slice only the lookback window rather than the whole history,
+            # so a rebuild costs the same on year 20 as on year 1.
+            start = max(0, htf_closed_count - lookback) if lookback else 0
+            levels = build_levels(htf_all[start:htf_closed_count], cfg)
 
         if not levels:
             continue

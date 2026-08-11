@@ -221,3 +221,40 @@ class TestCollectSignals:
         for t in collect_signals(m1, cfg).trades:
             assert t.outcome in ("TP", "SL", "TIMEOUT")
             assert t.exit_price is not None
+
+
+class TestScaling:
+    """Levels must be rebuilt once per HTF bar, not once per entry bar.
+
+    Rebuilding per entry bar made the replay quadratic — fine on a week of
+    data, hours on a multi-year file. This is the deterministic version of
+    that check, with no timing flakiness.
+    """
+
+    def series(self, minutes):
+        return [
+            bar(i, 2700 + (i % 13), 2710 + (i % 13), 2690 + (i % 13), 2700 + (i % 7))
+            for i in range(minutes)
+        ]
+
+    def test_rebuilds_track_htf_bars_not_entry_bars(self):
+        cfg = SnrConfig(level_tf="H4", entry_tf="M15", use_session_filter=False)
+
+        run = collect_signals(self.series(20_000), cfg)
+
+        entry_bars = run.stats["entry_bars"]
+        rebuilds = run.stats["level_rebuilds"]
+        expected_htf = 20_000 // 240  # H4 buckets in the series
+
+        assert rebuilds <= expected_htf + 2
+        assert rebuilds < entry_bars / 10  # nowhere near per-entry-bar
+
+    def test_rebuild_count_grows_with_the_level_timeframe_not_the_data(self):
+        coarse = SnrConfig(level_tf="D1", entry_tf="M15", use_session_filter=False)
+        fine = SnrConfig(level_tf="H1", entry_tf="M15", use_session_filter=False)
+        series = self.series(20_000)
+
+        assert (
+            collect_signals(series, coarse).stats["level_rebuilds"]
+            < collect_signals(series, fine).stats["level_rebuilds"]
+        )
