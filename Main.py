@@ -471,7 +471,9 @@ def ask_groq(user_message: str, price_ctx: str) -> str:
             timeout=15,
         )
         data = r.json()
-        return data["choices"][0]["message"]["content"]
+        # Harmless on the current model, which does not think out loud, but
+        # keeps a future swap to a reasoning model from leaking a scratchpad.
+        return strip_reasoning(data["choices"][0]["message"]["content"] or "")
     except Exception as e:
         log.error(f"Groq error: {e}")
         raise
@@ -602,14 +604,34 @@ GROQ_VISION_MODELS = [
     m.strip()
     for m in os.environ.get(
         "GROQ_VISION_MODEL",
-        # Groq's own vision docs name this one for image input, so it leads.
-        "qwen/qwen3.6-27b,"
-        # Kept behind it only as fallbacks if that model is ever retired.
-        "meta-llama/llama-4-maverick-17b-128e-instruct,"
-        "meta-llama/llama-4-scout-17b-16e-instruct",
+        # Groq's own vision docs name this one for image input, and it is the
+        # only one confirmed to answer on this account. Both Llama 4 vision
+        # models were tried and returned "model not found", so they are gone
+        # rather than sitting here burning a round-trip on every failure.
+        "qwen/qwen3.6-27b",
     ).split(",")
     if m.strip()
 ]
+
+# Reasoning models wrap their scratchpad in <think> tags. Groq can strip it
+# server-side, but not every model accepts the parameter, so the tags get
+# removed here too.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Return the answer only, with any reasoning scratchpad removed.
+
+    An *unclosed* <think> means the model ran out of budget mid-thought: there
+    is no answer after it, only half a monologue. Returning nothing in that
+    case is honest — the caller reports a failure instead of presenting
+    the model talking to itself as analysis.
+    """
+    cleaned = _THINK_BLOCK.sub("", text)
+    lowered = cleaned.lower()
+    if "<think>" in lowered:
+        cleaned = cleaned[: lowered.index("<think>")]
+    return cleaned.strip()
 
 
 def _request_chart_scan_groq(image_data: str, mime_type: str, model: str) -> str:
@@ -618,35 +640,57 @@ def _request_chart_scan_groq(image_data: str, mime_type: str, model: str) -> str
     Raises with the response body rather than a bare status, because Groq puts
     the useful part — an unknown model, a rate limit — in the body.
     """
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": CHART_SCAN_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{image_data}"
-                            },
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CHART_SCAN_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}"
                         },
-                    ],
-                }
-            ],
-            "max_tokens": 500,
-        },
-        timeout=30,
-    )
+                    },
+                ],
+            }
+        ],
+        # Reasoning tokens come out of this same budget. At 500 the model
+        # spent the lot thinking and the reply was truncated mid-sentence,
+        # so there is room for both now.
+        "max_tokens": 2000,
+        # Ask Groq to drop the scratchpad server-side. Not every model takes
+        # this parameter — see the retry below.
+        "reasoning_format": "hidden",
+    }
+
+    def post(body):
+        return requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+
+    r = post(payload)
+    if r.status_code == 400 and "reasoning" in r.text.lower():
+        # This model does not know the parameter. Drop it and try once more;
+        # strip_reasoning below handles the tags that then come back.
+        payload.pop("reasoning_format", None)
+        r = post(payload)
+
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    return r.json()["choices"][0]["message"]["content"]
+
+    content = r.json()["choices"][0]["message"]["content"] or ""
+    answer = strip_reasoning(content)
+    if content.strip() and not answer:
+        raise RuntimeError("spent its whole token budget thinking, no answer left")
+    return answer
 
 
 async def scan_chart_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:

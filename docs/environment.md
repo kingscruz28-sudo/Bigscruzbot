@@ -16,9 +16,22 @@ is missing. Anything not on this list has no effect on the bot.
 | Variable | Default | Used by | Notes |
 |---|---|---|---|
 | `GROQ_API_KEY` | empty | `ask_jarvis` | **Primary** chat provider. While this is set, Anthropic is only the fallback. Clear it to route chat to Claude. |
-| `ANTHROPIC_API_KEY` | empty | chart scan, chat fallback | Chart scanning has no fallback — if this is unset or the account is out of credit, `/photo` scans fail outright. |
+| `ANTHROPIC_API_KEY` | empty | chart scan, chat fallback | Preferred chart reader. If it is unset or out of credit, scans fall back to Groq instead of failing. |
+| `GROQ_VISION_MODEL` | `qwen/qwen3.6-27b` | `scan_chart_image` | Comma-separated; first model that answers wins. **Does not normally need setting** — the default is the model Groq's vision docs name. Only set it if Groq retires that model. |
 | `CHAT_MODEL` | `claude-opus-5` | `ask_anthropic` | Override without a code change. |
 | `CHART_SCAN_MODEL` | `claude-opus-5` | `scan_chart_image` | Override without a code change. Set to `claude-haiku-4-5` to cut scan cost roughly fivefold. |
+
+### Reasoning models and the token budget
+
+`qwen/qwen3.6-27b` thinks in a `<think>` block before answering, and those
+tokens come out of the same `max_tokens` as the reply. At 500 it spent the
+whole budget thinking and the answer was truncated mid-sentence, so the scan
+now asks for 2000 and sends `reasoning_format: hidden`.
+
+Models that do not accept that parameter return HTTP 400; the request is
+retried once without it and `strip_reasoning()` removes the tags locally.
+An *unclosed* `<think>` is treated as a failure rather than a read — it means
+the model ran out of room mid-thought, so there is no analysis to show.
 
 ### Credit exhaustion looks like a key problem but is not
 
