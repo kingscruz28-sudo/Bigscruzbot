@@ -9,6 +9,7 @@ import anthropic
 import base64
 import random
 import re
+import memory
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from telegram import Update
@@ -617,13 +618,19 @@ def ask_anthropic(user_message: str, price_ctx: str) -> str:
     return text
 
 
-def ask_jarvis(user_message: str, prices: dict | None = None) -> str:
+def ask_jarvis(user_message: str, prices: dict | None = None,
+               include_memory: bool = True) -> str:
     utc_hour  = datetime.now(timezone.utc).hour
     session   = get_session(utc_hour)
     price_ctx = f"\nCurrent session: {session} (UTC {utc_hour}:00)\n"
     if prices:
         lines = [f"  {SYMBOLS.get(s, s)}: {p:.4f}" for s, p in prices.items() if p]
         price_ctx += "Current prices:\n" + "\n".join(lines)
+
+    # Past calls that have actually finished. Off when writing a lesson, so a
+    # review is judged on its own trade rather than echoing earlier ones.
+    if include_memory:
+        price_ctx += memory.lessons_prompt()
 
     if GROQ_API_KEY:
         try:
@@ -1260,6 +1267,46 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/memory — the running record, and what it learned from it."""
+    symbol = None
+    if getattr(ctx, "args", None):
+        wanted = ctx.args[0].upper().replace("USD", "/USD").replace("//", "/")
+        symbol = next((s for s in SYMBOLS if s.upper() == wanted), None)
+        if symbol is None:
+            await update.message.reply_text(
+                f"Unknown symbol. Try one of: {', '.join(SYMBOLS)}"
+            )
+            return
+
+    s = memory.stats(symbol)
+    scope = symbol or "all symbols"
+
+    if not s["resolved"] and not s["pending"]:
+        await update.message.reply_text(
+            f"🧠 No calls recorded yet for {scope}.\n"
+            "Signals get logged as they fire, then reviewed once they hit TP or SL."
+        )
+        return
+
+    lines = [
+        f"🧠 Jarvis memory — {scope}",
+        "",
+        f"Resolved: {s['resolved']}  (✅ {s['wins']} / ❌ {s['losses']})",
+        f"Win rate: {s['win_rate']:.0f}%",
+        f"Total: {s['total_r']:+.2f}R",
+        f"Still open: {s['pending']}",
+    ]
+
+    lessons = memory.recent_lessons(symbol, limit=5)
+    if lessons:
+        lines += ["", "Recent lessons:"]
+        lines += [f"• [{e.symbol} {e.direction} → {e.outcome}] {e.lesson}" for e in lessons]
+
+    text = "\n".join(lines)
+    await update.message.reply_text(text[:4000])
+
+
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     articles = fetch_news(5)
     if not articles:
@@ -1408,6 +1455,47 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # BACKGROUND SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 
+LESSON_PROMPT = (
+    "You called this trade and now you know how it ended. In 1-2 sentences of "
+    "plain prose, no bullets, say what the setup was, whether the read was "
+    "right, and one concrete thing to apply next time. Be specific and terse — "
+    "this goes into a log another analyst reads before the next call, so every "
+    "word must earn its place."
+)
+
+
+def review_resolved_trade(entry) -> str:
+    """Write the lesson for a finished trade, and tell him it closed.
+
+    Costs one cheap LLM call per resolved signal — a handful a day, not per
+    scan. If no provider answers, the outcome is still recorded; only the
+    lesson is lost.
+    """
+    verdict = "hit TP" if entry.outcome == "TP" else (
+        "hit SL" if entry.outcome == "SL" else "expired unresolved"
+    )
+    facts = (
+        f"{entry.symbol} {entry.direction} in the {entry.session} session. "
+        f"Entry {entry.entry}, SL {entry.sl}, TP {entry.tp}. "
+        f"It {verdict} at {entry.exit_price} ({entry.r_multiple:+.2f}R)."
+    )
+
+    lesson = ""
+    try:
+        lesson = ask_jarvis(
+            f"{LESSON_PROMPT}\n\n{facts}", None, include_memory=False
+        ).strip()
+    except Exception as e:
+        log.warning(f"Could not write lesson for {entry.id}: {e}")
+
+    if lesson:
+        memory.save_lesson(entry.id, lesson)
+
+    icon = "✅" if entry.outcome == "TP" else ("❌" if entry.outcome == "SL" else "⌛")
+    safe_send(f"{icon} Closed: {facts}" + (f"\n\n🧠 {lesson}" if lesson else ""))
+    return lesson
+
+
 def scanner_loop():
     while _event_loop is None:
         time.sleep(1)
@@ -1464,10 +1552,16 @@ def scanner_loop():
                 if len(price_history[sym]) > 200:
                     price_history[sym] = price_history[sym][-200:]
 
+                # Close out anything this price settled, and learn from it
+                # before looking for the next setup.
+                for done in memory.resolve(sym, price):
+                    review_resolved_trade(done)
+
                 if loop_count % 5 == 0 and is_signal_allowed(session):
                     sig = detect_crt_signal(sym, price, session)
                     if sig:
                         safe_send(sig.text)
+                        memory.record_signal(sig)
                         if AUTO_TRADE:
                             execute_trade_via_bridge(sig)
 
@@ -1623,6 +1717,7 @@ def main():
     app.add_handler(CommandHandler("news",    cmd_news))
     app.add_handler(CommandHandler("models",  cmd_models))
     app.add_handler(CommandHandler("cot",     cmd_cot))
+    app.add_handler(CommandHandler("memory",  cmd_memory))
     app.add_handler(CommandHandler("signal",  cmd_signal))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("chat",    cmd_chat))

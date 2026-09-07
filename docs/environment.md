@@ -137,3 +137,41 @@ than sent as null, so the parsing coerces defensively.
 The report is measured on a Tuesday and published the following Friday, so it
 is structurally a few days behind price. It is positioning context for a level
 you already have, not an entry trigger, and the command's output says so.
+
+## Decision memory
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `MEMORY_PATH` | `/tmp/jarvis_memory.jsonl` | `memory.py` | Where the decision log is written. **Point this at a mounted volume** — see below. |
+| `MEMORY_PENDING_TTL` | `86400` | `memory.resolve` | Seconds before an unresolved signal is written off as `EXPIRED`. |
+
+Every fired signal is logged as `pending`. The scanner checks live price against
+each open entry on every pass; when price reaches TP or SL the entry resolves,
+one cheap LLM call writes a one-line lesson, and that lesson is read back into
+future analysis prompts. `/memory` shows the record.
+
+Only **resolved** entries are ever read back. A trade still running has taught
+nothing yet, and injecting it would let Jarvis learn from an outcome that has
+not happened — the same look-ahead trap the backtest guards against.
+
+### ⚠️ Railway wipes this on every redeploy
+
+A container's filesystem is ephemeral. With the default path under `/tmp`, the
+whole record is lost each time the bot redeploys, and Jarvis starts again with
+no memory.
+
+To keep it, add a Railway **Volume**, mount it at `/data`, and set:
+
+```
+MEMORY_PATH=/data/jarvis_memory.jsonl
+```
+
+Until that is done the feature works, but only within a single deployment. The
+code does not fail without the volume — it just forgets, which is worth knowing
+before reading anything into an empty `/memory`.
+
+### Expired is not a loss
+
+A signal that never reached TP or SL is recorded as `EXPIRED` and excluded from
+the win rate entirely. Counting it either way would misstate the record — it
+resolved in neither direction.
